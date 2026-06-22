@@ -49,7 +49,7 @@ User adds account via CLI (not the agent):
 spectre add myaccount "auth_token=xxx; ct0=yyy"
 ```
 
-Cookies from: Browser DevTools → Application → Cookies → x.com (need both `auth_token` and `ct0`).
+Cookies from: Browser DevTools → Storage → Cookies → x.com (need both `auth_token` and `ct0`).
 
 ## How To Use Each Category
 
