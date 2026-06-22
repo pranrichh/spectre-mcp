@@ -1,6 +1,6 @@
 [project]
 name = "spectre-mcp"
-version = "1.0.1"
+version = "1.0.2"
 description = "104 tools for X/Twitter automation — direct GraphQL/REST API, no browser, no API keys, free."
 readme = "README.md"
 homepage = "https://github.com/pranrichh/spectre-mcp"
