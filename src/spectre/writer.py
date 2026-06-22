@@ -1451,13 +1451,17 @@ class Writer:
     def _extract_user_info(user_result: dict) -> dict:
         """Extract clean user info from a GraphQL user result object."""
         legacy = user_result.get("legacy", {})
-        # Some GraphQL endpoints (e.g. BlueVerifiedFollowers) nest differently
-        core_result = user_result.get("core", {}).get("user_results", {}).get("result", {})
+        core = user_result.get("core", {})
+        # Two nesting patterns:
+        # 1. Tweet-embedded users: core.user_results.result.legacy (has screen_name)
+        # 2. Standalone user lists (BlueVerifiedFollowers, FollowersYouKnow, etc.):
+        #    core directly has {name, screen_name, created_at}
+        core_result = core.get("user_results", {}).get("result", {})
         core_legacy = core_result.get("legacy", {}) if core_result else {}
         return {
             "user_id": user_result.get("rest_id"),
-            "username": legacy.get("screen_name") or core_legacy.get("screen_name"),
-            "name": legacy.get("name") or core_legacy.get("name"),
+            "username": legacy.get("screen_name") or core_legacy.get("screen_name") or core.get("screen_name"),
+            "name": legacy.get("name") or core_legacy.get("name") or core.get("name"),
             "description": legacy.get("description") or core_legacy.get("description"),
             "followers_count": legacy.get("followers_count", 0) or core_legacy.get("followers_count", 0),
             "following_count": legacy.get("friends_count", 0) or core_legacy.get("friends_count", 0),
