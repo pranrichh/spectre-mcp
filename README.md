@@ -364,7 +364,7 @@ Full lifecycle: create → manage members → subscribe → delete.
 
 ### Hermes Agent (Recommended)
 
-Spectre was built for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Install the skill for best results:
+Spectre was built for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Install the MCP server and skill for best results:
 
 1. Add the MCP server to `~/.hermes/config.yaml`:
    ```yaml
@@ -374,8 +374,16 @@ Spectre was built for [Hermes Agent](https://github.com/NousResearch/hermes-agen
        args: ["spectre-mcp"]
        timeout: 120
    ```
-2. Copy `SPECTRE.md` into `~/.hermes/skills/` (or install from the skill registry if available)
-3. Run `/reload-mcp` to connect
+2. Install the skill (Hermes discovers skills at `~/.hermes/skills/<category>/<name>/SKILL.md`):
+   ```bash
+   mkdir -p ~/.hermes/skills/mcp/spectre
+   cp SKILL.md ~/.hermes/skills/mcp/spectre/SKILL.md
+   ```
+3. Reload in your Hermes session:
+   ```
+   /reload-mcp
+   /reload-skills
+   ```
 
 The skill gives Hermes full context on all 104 tools — parameter types, safe vs. destructive tools, usage patterns, and error handling.
 
