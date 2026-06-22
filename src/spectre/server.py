@@ -1,6 +1,6 @@
 """Spectre — MCP server for X/Twitter automation.
 
-The fastest X/Twitter automation for AI agents. 105 tools.
+The fastest X/Twitter automation for AI agents. 104 tools.
 Cookie-based auth, no paid API keys, automatic account rotation.
 """
 
@@ -48,7 +48,7 @@ def _get_writer() -> Writer:
         db = os.environ.get("SPECTRE_DB", os.path.join(os.path.expanduser("~"), ".spectre", "accounts.db"))
         from twscrape.accounts_pool import AccountsPool
         pool = AccountsPool(db)
-        _writer = Writer(pool=pool, proxy=proxy)
+        _writer = Writer(pool=pool, proxy=proxy, db_path=db)
     return _writer
 
 

@@ -230,9 +230,10 @@ class Writer:
     the first active account. Rate limits are caught and surfaced clearly.
     """
 
-    def __init__(self, pool, proxy: Optional[str] = None):
+    def __init__(self, pool, proxy: Optional[str] = None, db_path: Optional[str] = None):
         self.pool = pool
         self.proxy = proxy
+        self.db_path = db_path
         self._preferred_account: Optional[str] = None
         self._auto_rotate: bool = True  # When False, only use preferred account
 
@@ -1206,7 +1207,7 @@ class Writer:
     async def get_user_tweets_and_replies(self, username: str, limit: int = 20) -> dict:
         """Get a user's tweets and replies."""
         from spectre.scraper import Scraper
-        scraper = Scraper()
+        scraper = Scraper(db_path=self.db_path, proxy=self.proxy)
         # Use the scraper's GraphQL to get tweets and replies
         user = await scraper.get_user(username)
         if user is None:
@@ -1241,7 +1242,7 @@ class Writer:
             if not acc:
                 return {"error": "No active accounts available."}
             from spectre.scraper import Scraper
-            scraper = Scraper()
+            scraper = Scraper(db_path=self.db_path, proxy=self.proxy)
             result = await scraper.get_user(acc.username)
             if result is None:
                 return {"error": f"User @{acc.username} not found"}
@@ -1450,16 +1451,19 @@ class Writer:
     def _extract_user_info(user_result: dict) -> dict:
         """Extract clean user info from a GraphQL user result object."""
         legacy = user_result.get("legacy", {})
+        # Some GraphQL endpoints (e.g. BlueVerifiedFollowers) nest differently
+        core_result = user_result.get("core", {}).get("user_results", {}).get("result", {})
+        core_legacy = core_result.get("legacy", {}) if core_result else {}
         return {
             "user_id": user_result.get("rest_id"),
-            "username": legacy.get("screen_name"),
-            "name": legacy.get("name"),
-            "description": legacy.get("description"),
-            "followers_count": legacy.get("followers_count", 0),
-            "following_count": legacy.get("friends_count", 0),
-            "statuses_count": legacy.get("statuses_count", 0),
-            "profile_image_url": legacy.get("profile_image_url_https"),
-            "verified": legacy.get("verified", False),
+            "username": legacy.get("screen_name") or core_legacy.get("screen_name"),
+            "name": legacy.get("name") or core_legacy.get("name"),
+            "description": legacy.get("description") or core_legacy.get("description"),
+            "followers_count": legacy.get("followers_count", 0) or core_legacy.get("followers_count", 0),
+            "following_count": legacy.get("friends_count", 0) or core_legacy.get("friends_count", 0),
+            "statuses_count": legacy.get("statuses_count", 0) or core_legacy.get("statuses_count", 0),
+            "profile_image_url": legacy.get("profile_image_url_https") or core_legacy.get("profile_image_url_https"),
+            "verified": legacy.get("verified", False) or core_legacy.get("verified", False),
             "blue_verified": user_result.get("is_blue_verified", False),
         }
     @staticmethod
@@ -1983,6 +1987,13 @@ class Writer:
             .get("result", {})
             .get("legacy", {})
         )
+        # Fallback: some responses (notifications) nest user differently
+        if not user_legacy.get("screen_name"):
+            alt_result = tweet_result.get("core", {}).get("user_results", {}).get("result", {})
+            if alt_result:
+                alt_core = alt_result.get("core", {}).get("user_results", {}).get("result", {})
+                if alt_core:
+                    user_legacy = alt_core.get("legacy", {}) or user_legacy
         return {
             "tweet_id": tweet_result.get("rest_id"),
             "text": legacy.get("full_text", ""),
