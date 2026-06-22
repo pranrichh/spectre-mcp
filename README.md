@@ -62,7 +62,7 @@ Extract cookies from your browser:
 
 1. Open **x.com** and make sure you're logged in
 2. Open **DevTools** (`F12` or `Ctrl+Shift+I`)
-3. Go to **Application** → **Storage** → **Cookies** → select **`https://x.com`**
+3. Go to **Storage** → **Cookies** → select **`https://x.com`**
 4. Find and copy these two values:
    - **`auth_token`** — long hex string (e.g. `a1b2c3d4...`)
    - **`ct0`** — 160-character hex string
