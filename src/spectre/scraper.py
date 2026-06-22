@@ -101,8 +101,24 @@ class Scraper:
         self.proxy = proxy
         self._api: Optional[API] = None
 
+    def _sanitize_db(self) -> None:
+        """Fix known twscrape DB issues that crash the server.
+
+        - last_used='0' causes datetime.fromisoformat('0') crash in twscrape.
+          Set to NULL so twscrape's `if doc['last_used']` check skips it.
+        """
+        import sqlite3
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("UPDATE accounts SET last_used = NULL WHERE last_used = '0' OR last_used = 0")
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass  # DB may not exist yet
+
     async def _get_api(self) -> API:
         if self._api is None:
+            self._sanitize_db()
             pool = AccountsPool(self.db_path)
             self._api = API(pool, proxy=self.proxy)
         return self._api
@@ -162,7 +178,7 @@ class Scraper:
         try:
             from twscrape.db import execute
             db_file = api.pool._db_file
-            await execute(db_file, "UPDATE accounts SET last_used = 0, locks = '{}', error_msg = NULL WHERE username = :username", {"username": username})
+            await execute(db_file, "UPDATE accounts SET last_used = NULL, locks = '{}', error_msg = NULL WHERE username = :username", {"username": username})
             return f"Account @{username} set as primary. It will be used first for all operations."
         except Exception as e:
             return f"Failed to set @{username} as primary: {e}"
