@@ -23,7 +23,7 @@ from spectre.writer import Writer
 
 mcp = FastMCP(
     "spectre",
-    instructions="The fastest X/Twitter automation for AI agents. 105 tools. Direct GraphQL/REST API calls, no browser needed. Cookie-based auth with account pool rotation. Set up accounts via: spectre add <username> \"auth_token=xxx; ct0=yyy\"",
+    instructions="The fastest X/Twitter automation for AI agents. 104 tools. Direct GraphQL/REST API calls, no browser needed. Cookie-based auth with account pool rotation. Set up accounts via: spectre add <username> \"auth_token=xxx; ct0=yyy\"",
 )
 
 # Global instances, initialized lazily
