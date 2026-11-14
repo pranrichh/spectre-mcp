@@ -3,6 +3,17 @@
 All notable changes to `spectre-mcp`. Versioning is semver; the tool surface is
 the public API.
 
+## 2.0.1 — 2026-11-14
+
+Documentation and listing refresh — no code changes.
+
+- README back to the original layout, with the new logo, current tool count and a
+  tools overview.
+- `docs/safety.md` and `docs/reference.md` rewritten to be shorter and more
+  practical: what to confirm, what each surface costs, what the limits are.
+- PyPI listing now mirrors the GitHub README (absolute asset URLs), and the
+  package description is the project tagline.
+
 ## 2.0.0 — 2026-11-14
 
 A correctness release. Every write now verifies itself, every failure carries a

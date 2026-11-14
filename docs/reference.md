@@ -6,8 +6,7 @@
 
 ## X query operators
 
-`search()` passes the query straight to X's search, so the whole operator
-language works:
+`search()` passes your query straight to X, so the whole operator language works:
 
 | Operator | Example | What it does |
 |--|--|--|
@@ -22,7 +21,7 @@ language works:
 | `min_retweets:` / `min_faves:` | `ai min_faves:100` | Engagement floor |
 | `-"term"` | `ai -"gpt"` | Exclude |
 | `OR` | `python OR rust` | Either |
-| `quoted_tweet_id:` | `quoted_tweet_id:2111...` | Quote posts of one post (what `get_tweet_quotes` uses) |
+| `quoted_tweet_id:` | `quoted_tweet_id:2111...` | Quotes of one post (`get_tweet_quotes` uses this) |
 
 ## CLI
 
@@ -31,18 +30,18 @@ spectre add <name> "<auth_token=...; ct0=...>"   verify + add an account
 spectre remove <name>                            drop an account
 spectre list                                     accounts and state
 spectre status                                   pool health (exit 1 if none active)
-spectre rename <old> <new>                       fix a stale handle, keep cookies
-spectre doctor                                   auth + read paths + operation table
+spectre rename <old> <new>                       fix a handle after a rename, keep cookies
+spectre doctor                                   auth + connectivity check
 spectre serve                                    start the MCP server (default)
 spectre --version
 ```
 
-`add` verifies the cookies with X and stores the account's **real** handle, so a
-renamed account keeps working. `doctor` is the first thing to run when something
-looks broken:
+`add` verifies the cookies with X before saving them and keeps the account's real
+handle, so a renamed account keeps working. `doctor` is the first thing to run
+when something looks wrong:
 
 ```text
-spectre doctor  v2.0.0
+spectre doctor  v2.0.1
 db      /home/you/.spectre/accounts.db
 pool    1 account(s): @handle
 ✓ auth    @handle (1234567890)
@@ -60,14 +59,13 @@ ops     90 operations loaded - override any with SPECTRE_OP_<NAME>
 | `SPECTRE_DB` | `~/.spectre/accounts.db` | Account pool database |
 | `SPECTRE_PROXY` | none | Global proxy (`http://user:pass@host:port`) |
 | `SPECTRE_OP_<NAME>` | built-in | Override one GraphQL query id, e.g. `SPECTRE_OP_CREATETWEET` |
-| `SPECTRE_LOG_LEVEL` | `ERROR` | `DEBUG` to see request-level logs, `OFF` for silence |
-| `TWS_HTTP_BACKEND` | `httpx` | `curl_cffi` for TLS fingerprinting on twscrape reads |
+| `SPECTRE_LOG_LEVEL` | `ERROR` | `DEBUG` for request logs, `OFF` for silence |
+| `TWS_HTTP_BACKEND` | `httpx` | `curl_cffi` for TLS fingerprinting on reads |
 | `TWS_TELEMETRY` | `0` | Disabled by default |
 
 ## Output shapes
 
-Every read returns the same shape regardless of whether it came from GraphQL or
-twscrape:
+Reads return the same shapes whether the data came from GraphQL or twscrape.
 
 **Tweet**
 
@@ -75,7 +73,7 @@ twscrape:
 {
   "id": "2121388517540716839",
   "url": "https://x.com/elonmusk/status/2121388517540716839",
-  "text": "full text, including long-form note_tweet bodies",
+  "text": "full text, including long-form posts",
   "author_id": "44196397", "author_username": "elonmusk", "author_name": "Elon Musk",
   "created_at": "2026-11-13T23:43:30+00:00", "lang": "en",
   "reply_count": 4069, "retweet_count": 6618, "like_count": 60118,
@@ -117,11 +115,11 @@ IDs are strings on the way out too — echo them back as-is.
 
 | `kind` | Meaning | What to do |
 |--|--|--|
-| `auth` | Cookies dead, account locked or suspended | `spectre add` again |
-| `rate_limit` | X or the local lock table says wait | wait `retry_after_seconds`, or switch accounts |
-| `permission` | X refuses for this account (Premium, privacy, blocked) | do not retry; tell the user |
-| `validation` | Bad input: wrong id, datetime, length | fix the argument |
-| `not_found` | Post/user/list gone, or a stale query id | check the id; `spectre doctor` if everything fails |
+| `auth` | Cookies dead, account locked or suspended | re-add the account |
+| `rate_limit` | Wait for the window, or switch accounts | retry after `retry_after_seconds` |
+| `permission` | X refuses for this account (Premium, privacy, blocked) | don't retry; tell the user |
+| `validation` | Bad input: id, datetime, length | fix the argument |
+| `not_found` | Post/user/list gone | check the id |
 | `upstream` | X returned something unusable | retry once, then report |
 
 ## Pagination
@@ -133,22 +131,15 @@ page = get_bookmarks(limit=100)
 page2 = get_bookmarks(limit=100, cursor=page["next_cursor"])
 ```
 
-`get_followers` / `get_following` walk up to 5000 and set `truncated: true` when
-the time budget stopped them early.
+`get_followers` / `get_following` walk up to 5000 and set `truncated: true` when the time budget stops them early.
 
-## Known limitations
+## Limits worth knowing
 
-- **Likes are private by default.** `get_user_likes` returns `[]` for most
-  accounts; that is X's setting, not a failure.
-- **Who-liked lists are restricted.** `get_favoriters` is empty on most large
-  posts.
-- **Similar posts and bookmark folders are Premium-gated.** They answer with
-  `note` or `kind: permission`.
-- **List memberships are unreliable.** X's memberships timeline returns nothing
-  for many accounts; the tool says so instead of pretending.
-- **DM history is whatever X serves the cookie session.** If a reply visible in
-  the browser is missing, X is not delivering it to this session.
-- **~3,200-post cap** on user timelines; use `search(from:… since:…)` for older.
-- **Notifications** could not be verified end-to-end: the test account has no
-  notifications at all, so only the parser is covered (fixture test). Check
-  against the web UI before trusting an empty result.
+- **Likes are private by default.** `get_user_likes` is empty for most accounts.
+- **Who-liked lists are restricted** on large posts, so `get_favoriters` often returns nothing.
+- **Similar posts and bookmark folders need Premium** → `kind: permission`.
+- **List memberships** (`get_list_memberships`) is unreliable upstream and often empty.
+- **DM history** is whatever X serves the cookie session; older messages can be missing.
+- **~3,200-post cap** on user timelines — use `search("from:… since:…")` for older posts.
+- **Notifications** only reflect activity on the authenticated account.
+- **One call, one page:** search returns ~20 results per request, so a high `limit` costs several requests.

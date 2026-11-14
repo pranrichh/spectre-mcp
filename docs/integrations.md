@@ -39,8 +39,8 @@ and ships a skill that teaches the agent when to reach for which tool.
    /reload-skills
    ```
 
-The skill is decision-oriented: which tool to reach for, what it costs, what
-must be confirmed first, and which failures mean "stop" rather than "retry".
+The skill covers which tool fits which job, what each call costs, what must be
+confirmed first, and which failures mean "stop" rather than "retry".
 
 ## Claude Desktop
 
