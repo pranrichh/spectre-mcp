@@ -339,38 +339,85 @@ def instructions(data: Any) -> list[dict]:
 
 
 def notifications(data: Any) -> list[dict]:
-    """Flatten a notification timeline into one record per notification."""
+    """Flatten a notification timeline into one record per notification.
+
+    X ships two shapes depending on the bundle: the older
+    `notificationType` + `tweet_results` item, and the current one where the
+    payload is flattened onto `itemContent` with the kind in `template.__typename`
+    and the text in `rich_message`. Both are handled here.
+    """
     out: list[dict] = []
     for entry in _entries(data):
         content = entry.get("content") or {}
         if content.get("entryType") == "TimelineTimelineCursor":
             continue
-        item_contexts: list[dict] = [content.get("itemContent") or {}]
+        contexts: list[dict] = [content.get("itemContent") or {}]
         for item in content.get("items") or []:
             inner = _dig(item, "item", "itemContent") or {}
             if inner:
-                item_contexts.append(inner)
-        for ctx in item_contexts:
-            ntype = ctx.get("notificationType") or ctx.get("notification_type") or ""
-            tweet = tweet_dict(_dig(ctx, "tweet_results", "result")) if ctx.get("tweet_results") else None
-            user = user_dict(_dig(ctx, "user_results", "result")) if ctx.get("user_results") else None
-            tweets = [tweet] if tweet else []
-            users = [user] if user else []
-            for item in _dig(ctx, "message", "message_results") or []:
-                pass
-            if not (ntype or tweets or users):
+                contexts.append(inner)
+        for ctx in contexts:
+            if not ctx:
                 continue
-            out.append(
-                {
-                    "id": entry.get("entryId"),
-                    "type": ntype,
-                    "user": user,
-                    "tweet": tweet,
-                    "users": users if len(users) > 1 else [],
-                    "tweets": tweets if len(tweets) > 1 else [],
-                }
-            )
+            if ctx.get("__typename") == "TimelineNotification" or ctx.get("rich_message"):
+                out.append(_notification_new(ctx, entry))
+                continue
+            record = _notification_legacy(ctx, entry)
+            if record:
+                out.append(record)
     return out
+
+
+def _notification_new(ctx: dict, entry: dict) -> dict:
+    """Current shape: text in rich_message, kind in template.__typename."""
+    template = ctx.get("template") or {}
+    url = _dig(ctx, "notification_url", "url")
+    tweet_id = None
+    if url and "/status/" in url:
+        tweet_id = url.rsplit("/status/", 1)[-1].split("?")[0] or None
+    actors: list[dict] = []
+    seen: set[str] = set()
+    for entity in _dig(ctx, "rich_message", "entities") or []:
+        user = user_dict(_dig(entity, "ref", "user_results", "result"))
+        if user and user["id"] not in seen:
+            seen.add(user["id"])
+            actors.append(user)
+    for user_res in template.get("from_users") or []:
+        user = user_dict(user_res.get("result") if isinstance(user_res, dict) else user_res)
+        if user and user["id"] not in seen:
+            seen.add(user["id"])
+            actors.append(user)
+    return {
+        "id": sid(ctx.get("id")) or entry.get("entryId"),
+        "type": template.get("__typename") or ctx.get("notification_icon") or "Notification",
+        "icon": ctx.get("notification_icon"),
+        "text": _dig(ctx, "rich_message", "text") or "",
+        "url": url,
+        "timestamp": iso_time(ctx.get("timestamp_ms")),
+        "actors": actors,
+        "user": actors[0] if actors else None,
+        "tweet_id": tweet_id,
+    }
+
+
+def _notification_legacy(ctx: dict, entry: dict) -> Optional[dict]:
+    ntype = ctx.get("notificationType") or ctx.get("notification_type") or ""
+    tweet = tweet_dict(_dig(ctx, "tweet_results", "result")) if ctx.get("tweet_results") else None
+    user = user_dict(_dig(ctx, "user_results", "result")) if ctx.get("user_results") else None
+    if not (ntype or tweet or user):
+        return None
+    return {
+        "id": entry.get("entryId"),
+        "type": ntype,
+        "icon": None,
+        "text": "",
+        "url": None,
+        "timestamp": None,
+        "actors": [user] if user else [],
+        "user": user,
+        "tweet": tweet,
+        "tweet_id": tweet["id"] if tweet else None,
+    }
 
 
 # ── direct messages ───────────────────────────────────────────────
@@ -384,8 +431,12 @@ def dm_messages(payload: dict) -> list[dict]:
     conversations = timeline_obj.get("conversations") or {}
     out: list[dict] = []
     for entry in entries:
-        msg = entry.get("message") or {}
+        msg = entry.get("message")
+        if not isinstance(msg, dict):
+            continue  # cursor rows and other non-message entries
         data = msg.get("message_data") or {}
+        if not data:
+            continue
         sender_id = sid(data.get("sender_id"))
         recipient_id = sid(data.get("recipient_id"))
         sender = users.get(sender_id or "", {}) or {}

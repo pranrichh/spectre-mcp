@@ -1,6 +1,6 @@
 [project]
 name = "spectre-mcp"
-version = "2.0.4"
+version = "2.0.5"
 description = "The fastest X/Twitter automation for AI agents — no browser, no API keys, no monthly fees."
 readme = "README.md"
 requires-python = ">=3.11"

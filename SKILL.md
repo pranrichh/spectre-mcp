@@ -11,7 +11,7 @@ metadata:
 # Spectre — X/Twitter for agents
 
 Spectre is not "a Twitter API". It is a live authenticated session on X, with
-111 tools, and it will happily post, DM or delete on your behalf. The skill of
+113 tools, and it will happily post, DM or delete on your behalf. The skill of
 using it is knowing **which call answers the question**, **what it costs**, and
 **when to stop and ask the user**.
 

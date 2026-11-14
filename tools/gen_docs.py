@@ -46,6 +46,8 @@ SECTIONS: list[tuple[str, str, list[str]]] = [
             "get_followers_you_know",
             "get_user_likes",
             "get_user_highlights",
+            "create_highlight",
+            "delete_highlight",
         ],
     ),
     (

@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import re
 import mimetypes
 import time
 import uuid
@@ -725,6 +726,11 @@ class Writer:
 
     @safe
     async def dm_conversation(self, conversation_id: str, limit: int = 50) -> dict:
+        if not re.fullmatch(r"[0-9][0-9-]{2,80}", str(conversation_id)):
+            raise XError(
+                "conversation_id must be numeric (e.g. 1861519570445426689-2059070955910299648).",
+                kind="validation",
+            )
         payload = await self.x.rest(
             "GET",
             f"dm/conversation/{conversation_id}.json",
@@ -1232,6 +1238,46 @@ class Writer:
                 fh.write(data)
             saved.append({"path": path, "bytes": len(data), "source_url": url})
         return {"files": saved, "count": len(saved)}
+
+    # ══════════════════════════════════════════════════════════
+    #  Highlights
+    # ══════════════════════════════════════════════════════════
+
+    @safe
+    async def create_highlight(self, tweet_ids: list[str]) -> dict:
+        """Add posts to the profile Highlights section."""
+        results: list[dict] = []
+        added = 0
+        refusals: list[str] = []
+        for tweet_id in tweet_ids:
+            data = await self.x.graphql("CreateHighlight", {"tweet_id": str(tweet_id)})
+            payload = (data.get("data") or {}).get("tweet_highlights_put") or {}
+            if payload.get("success") is False or payload.get("message"):
+                message = payload.get("message") or "refused"
+                refusals.append(message)
+                results.append({"tweet_id": str(tweet_id), "status": "refused", "message": message})
+            else:
+                added += 1
+                results.append({"tweet_id": str(tweet_id), "status": "added"})
+        if results and added == 0:
+            raise XError(
+                f"X refused the highlight: {refusals[0]}",
+                kind="permission",
+                hint="Highlights are limited to eligible accounts.",
+            )
+        return {"highlights": results, "count": len(results), "added": added}
+
+    @safe
+    async def delete_highlight(self, tweet_id: str) -> dict:
+        """Remove a post from the profile Highlights section."""
+        data = await self.x.graphql("DeleteHighlight", {"tweet_id": str(tweet_id)})
+        payload = (data.get("data") or {}).get("tweet_highlights_delete") or {}
+        if payload.get("success") is False or payload.get("message"):
+            raise XError(
+                f"X refused to remove the highlight: {payload.get('message') or 'refused'}",
+                kind="permission",
+            )
+        return {"status": "removed", "tweet_id": str(tweet_id)}
 
     # ══════════════════════════════════════════════════════════
     #  Limits / health

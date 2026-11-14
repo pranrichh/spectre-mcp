@@ -3,6 +3,19 @@
 All notable changes to `spectre-mcp`. Versioning is semver; the tool surface is
 the public API.
 
+## 2.0.5 — 2026-11-14
+
+- **Highlights are back.** `create_highlight` and `delete_highlight` were dropped
+  during the rewrite; both are restored against X's current mutations, with a
+  clear `kind: permission` when the account is not eligible.
+- **Notifications parse X's current shape.** The payload moved onto
+  `itemContent` with the kind in `template.__typename` and the text in
+  `rich_message`; the old `notificationType` field is gone. Both shapes are
+  handled, with actors resolved from the rich-text entities.
+- **DM timelines skip cursor rows.** Cursor entries no longer turn into blank
+  messages that eat the page limit.
+- `get_dm_conversation` validates `conversation_id` before putting it in a URL.
+
 ## 2.0.4 — 2026-11-14
 
 `spectre doctor` keeps the query-id table current, plus a documentation pass.

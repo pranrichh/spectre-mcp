@@ -2,7 +2,7 @@
   <img src="../assets/headers/tools.svg" alt="Tools" />
 </p>
 
-111 tools, generated from the live registry.
+113 tools, generated from the live registry.
 Every tool returns JSON. Failures look like
 `{"error": "...", "kind": "auth|rate_limit|permission|validation|not_found|upstream", "hint": "..."}`.
 
@@ -150,6 +150,16 @@ Usually empty: X hides likes for most accounts.
 Posts a user pinned to their profile Highlights section.
 
 Highlights are curated, so this is the closest thing to "what they want to be known for".
+
+### `create_highlight(tweet_ids)`
+
+Add posts to your profile's Highlights section (comma-separated ids).
+
+Highlights are public. X limits the feature to eligible accounts and answers `kind: permission` for the rest.
+
+### `delete_highlight(tweet_id)`
+
+Remove a post from your profile's Highlights section.
 
 ---
 

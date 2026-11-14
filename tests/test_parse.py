@@ -198,3 +198,67 @@ def test_dm_messages_resolves_sender_from_users_map():
     assert messages[0]["sender_username"] == "sender"
     assert messages[0]["conversation_name"] == "chat"
     assert messages[0]["timestamp"].startswith("2026-")
+
+
+def test_notifications_current_shape():
+    """Current bundle: payload flattened on itemContent, kind in template."""
+    payload = {
+        "instructions": [
+            {
+                "entries": [
+                    {
+                        "entryId": "notif-42",
+                        "content": {
+                            "entryType": "TimelineTimelineItem",
+                            "itemContent": {
+                                "__typename": "TimelineNotification",
+                                "id": "42",
+                                "notification_icon": "heart_icon",
+                                "timestamp_ms": "2025-05-05T01:18:21.657Z",
+                                "rich_message": {
+                                    "text": "Ada liked your post",
+                                    "entities": [
+                                        {
+                                            "fromIndex": 0,
+                                            "toIndex": 3,
+                                            "ref": {
+                                                "type": "TimelineRichTextUser",
+                                                "user_results": {"result": {"rest_id": "9", "core": {"screen_name": "ada", "name": "Ada"}}},
+                                            },
+                                        }
+                                    ],
+                                },
+                                "notification_url": {"url": "https://x.com/ada/status/777"},
+                                "template": {"__typename": "TimelineNotificationAggregateUserActions", "from_users": []},
+                            },
+                        },
+                    }
+                ]
+            }
+        ]
+    }
+    items = notifications(payload)
+    assert len(items) == 1
+    item = items[0]
+    assert item["type"] == "TimelineNotificationAggregateUserActions"
+    assert item["text"] == "Ada liked your post"
+    assert item["tweet_id"] == "777"
+    assert item["timestamp"].startswith("2025-05-05")
+    assert item["actors"][0]["username"] == "ada"
+
+
+def test_dm_messages_skips_cursor_rows():
+    payload = {
+        "conversation_timeline": {
+            "entries": [
+                {"entryId": "cursor-top-1", "content": {"entryType": "TimelineTimelineCursor"}},
+                {"entryId": "cursor-bottom-1", "content": {"entryType": "TimelineTimelineCursor"}},
+                {"message": {"id": "77", "conversation_id": "1-2", "message_data": {"sender_id": "2", "recipient_id": "1", "text": "yo"}}},
+            ],
+            "users": {"2": {"screen_name": "them"}},
+        }
+    }
+    messages = dm_messages(payload)
+    assert len(messages) == 1
+    assert messages[0]["text"] == "yo"
+    assert messages[0]["sender_username"] == "them"

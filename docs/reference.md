@@ -42,7 +42,7 @@ current GraphQL query ids from X's live bundles and stores them in
 `~/.spectre/ops.json`, so a rotation upstream does not need a release:
 
 ```text
-spectre doctor  v2.0.4
+spectre doctor  v2.0.5
 db      /home/you/.spectre/accounts.db
 pool    1 account(s): @handle
 ✓ auth    @handle (1234567890)

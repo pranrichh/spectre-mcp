@@ -417,6 +417,25 @@ async def get_user_highlights(user_id: XId, limit: int = 20) -> str:
     return json.dumps({"tweets": tweets, "count": len(tweets), "next_cursor": cursor}, indent=2, default=str, ensure_ascii=False)
 
 
+@mcp.tool()
+async def create_highlight(tweet_ids: str) -> str:
+    """Add posts to your profile's Highlights section (comma-separated ids).
+
+    Highlights are public. X limits the feature to eligible accounts and answers
+    `kind: permission` for the rest.
+    """
+    ids = [x.strip() for x in str(tweet_ids).split(",") if x.strip()]
+    if not ids:
+        return json.dumps({"error": "Pass at least one tweet id", "kind": "validation"})
+    return await _out(_get_writer().create_highlight(ids[:20]))
+
+
+@mcp.tool()
+async def delete_highlight(tweet_id: XId) -> str:
+    """Remove a post from your profile's Highlights section."""
+    return await _out(_get_writer().delete_highlight(str(tweet_id)))
+
+
 # ══════════════════════════════════════════════════════════════
 #  Posts
 # ══════════════════════════════════════════════════════════════
