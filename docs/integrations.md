@@ -2,13 +2,18 @@
   <img src="../assets/headers/integrations.svg" alt="Integrations" />
 </p>
 
-Spectre works with any client that supports the [Model Context Protocol](https://modelcontextprotocol.io). The server command is always `uvx spectre-mcp`.
+# Integrations
 
-## Hermes Agent (Recommended)
+Spectre is a standard MCP server over stdio. The command is always
+`uvx spectre-mcp` (or `spectre-mcp` if installed system-wide).
 
-Spectre was built for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Install the MCP server and skill for best results:
+## Hermes Agent (recommended)
 
-1. Add the MCP server to `~/.hermes/config.yaml`:
+Spectre was built for [Hermes Agent](https://github.com/NousResearch/hermes-agent),
+and ships a skill that teaches the agent when to reach for which tool.
+
+1. Add the server to `~/.hermes/config.yaml`:
+
    ```yaml
    mcp_servers:
      spectre:
@@ -16,22 +21,30 @@ Spectre was built for [Hermes Agent](https://github.com/NousResearch/hermes-agen
        args: ["spectre-mcp"]
        timeout: 120
    ```
-2. Install the skill (Hermes discovers skills at `~/.hermes/skills/<category>/<name>/SKILL.md`):
+
+2. Install the skill (Hermes discovers `~/.hermes/skills/<category>/<name>/SKILL.md`):
+
    ```bash
-   mkdir -p ~/.hermes/skills/mcp/spectre
-   cp SKILL.md ~/.hermes/skills/mcp/spectre/SKILL.md
+   mkdir -p ~/.hermes/skills/mcp/spectre/references
+   curl -fsSL https://raw.githubusercontent.com/pranrichh/spectre-mcp/main/SKILL.md \
+     -o ~/.hermes/skills/mcp/spectre/SKILL.md
+   curl -fsSL https://raw.githubusercontent.com/pranrichh/spectre-mcp/main/references/full-follower-extraction.md \
+     -o ~/.hermes/skills/mcp/spectre/references/full-follower-extraction.md
    ```
-3. Reload in your Hermes session:
+
+3. Reload:
+
    ```
    /reload-mcp
    /reload-skills
    ```
 
-The skill gives Hermes full context on all 104 tools — parameter types, safe vs. destructive tools, usage patterns, and error handling.
+The skill is decision-oriented: which tool to reach for, what it costs, what
+must be confirmed first, and which failures mean "stop" rather than "retry".
 
 ## Claude Desktop
 
-Add to `claude_desktop_config.json`:
+`claude_desktop_config.json`:
 
 ```json
 {
@@ -44,11 +57,11 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
-Claude automatically discovers all 104 tools. No skill file needed — the tool descriptions are self-documenting.
+Claude reads the tool docstrings directly, so no extra skill file is needed.
 
 ## Cursor / Windsurf / Cline
 
-Add to `.cursor/mcp.json` (or equivalent):
+`.cursor/mcp.json` (or the equivalent config for your client):
 
 ```json
 {
@@ -61,7 +74,7 @@ Add to `.cursor/mcp.json` (or equivalent):
 }
 ```
 
-## Custom Integration (Python)
+## From Python
 
 ```python
 from mcp import ClientSession, StdioServerParameters
@@ -72,14 +85,34 @@ async with stdio_client(server) as (read, write):
     async with ClientSession(read, write) as session:
         await session.initialize()
         tools = await session.list_tools()
-        # Use any of the 104 tools
+        me = await session.call_tool("get_me", {})
+```
+
+Or skip MCP and import the writer directly (same code the server runs):
+
+```python
+import asyncio
+from twscrape.accounts_pool import AccountsPool
+from spectre.writer import Writer
+from spectre.xclient import XClient
+
+async def main():
+    pool = AccountsPool()                      # ~/.spectre/accounts.db
+    writer = Writer(XClient(pool))
+    print(await writer.me())
+    print(await writer.search_bookmarks("mcp"))
+
+asyncio.run(main())
 ```
 
 ## Updating
 
-`uvx` always pulls the latest version from PyPI automatically. For manual upgrades:
+`uvx` always resolves the latest PyPI release. For managed installs:
 
 ```bash
-pipx upgrade spectre-mcp    # pipx
-uv tool upgrade spectre-mcp  # uv
+pipx upgrade spectre-mcp      # pipx
+uv tool upgrade spectre-mcp   # uv
 ```
+
+After upgrading, run `spectre doctor` — it re-checks auth and the GraphQL
+operation table, which is the thing most likely to age.

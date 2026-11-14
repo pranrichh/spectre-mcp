@@ -2,59 +2,153 @@
   <img src="../assets/headers/reference.svg" alt="Reference" />
 </p>
 
-## X Query Operators
+# Reference
 
-| Operator | Example | Description |
-|----------|---------|-------------|
-| `from:username` | `from:elonmusk` | Tweets by a user |
-| `since:YYYY-MM-DD` | `since:2026-01-01` | After date |
-| `until:YYYY-MM-DD` | `until:2026-06-01` | Before date |
-| `#hashtag` | `#python` | Hashtag search |
-| `filter:media` | `AI filter:media` | Only media tweets |
-| `filter:links` | `AI filter:links` | Only tweets with links |
-| `lang:en` | `AI lang:en` | Language filter |
-| `min_retweets:N` | `AI min_retweets:100` | Minimum retweets |
-| `min_faves:N` | `AI min_faves:50` | Minimum likes |
-| `-"term"` | `AI -"GPT"` | Exclude term |
-| `OR` | `python OR rust` | Either term |
+## X query operators
+
+`search()` passes the query straight to X's search, so the whole operator
+language works:
+
+| Operator | Example | What it does |
+|--|--|--|
+| `from:` / `to:` | `from:elonmusk` | Posts by / replies to a handle |
+| `since:` / `until:` | `since:2026-01-01` | Date range (`YYYY-MM-DD`) |
+| `#tag` / `$cashtag` | `#python` | Hashtag or cashtag |
+| `filter:media` | `ai filter:media` | Only posts with media |
+| `filter:links` | `ai filter:links` | Only posts with links |
+| `filter:replies` | `ai filter:replies` | Include replies |
+| `filter:follows` | `ai filter:follows` | Only accounts you follow |
+| `lang:` | `ai lang:en` | Language |
+| `min_retweets:` / `min_faves:` | `ai min_faves:100` | Engagement floor |
+| `-"term"` | `ai -"gpt"` | Exclude |
+| `OR` | `python OR rust` | Either |
+| `quoted_tweet_id:` | `quoted_tweet_id:2111...` | Quote posts of one post (what `get_tweet_quotes` uses) |
 
 ## CLI
 
 ```bash
-spectre add <username> <cookies>     Add account via browser cookies
-spectre remove <username>            Remove an account
-spectre list                         List all accounts
-spectre status                       Pool health check
-spectre serve                        Start MCP server (default)
-spectre help                         Show help
+spectre add <name> "<auth_token=...; ct0=...>"   verify + add an account
+spectre remove <name>                            drop an account
+spectre list                                     accounts and state
+spectre status                                   pool health (exit 1 if none active)
+spectre rename <old> <new>                       fix a stale handle, keep cookies
+spectre doctor                                   auth + read paths + operation table
+spectre serve                                    start the MCP server (default)
+spectre --version
 ```
 
-## Environment Variables
+`add` verifies the cookies with X and stores the account's **real** handle, so a
+renamed account keeps working. `doctor` is the first thing to run when something
+looks broken:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SPECTRE_DB` | `~/.spectre/accounts.db` | Account pool database path |
-| `SPECTRE_PROXY` | none | Global proxy (`socks5://user:pass@host:port`) |
-| `TWS_HTTP_BACKEND` | `httpx` | Set to `curl_cffi` for TLS fingerprinting |
-| `TWS_TELEMETRY` | `0` | Disable telemetry |
-| `SPECTRE_OP_*` | built-in | Override GraphQL operation IDs (when they rotate) |
+```text
+spectre doctor  v2.0.0
+db      /home/you/.spectre/accounts.db
+pool    1 account(s): @handle
+✓ auth    @handle (1234567890)
+✓ profile ok
+✓ timeline ok
+✓ search  ok
+ops     90 operations loaded - override any with SPECTRE_OP_<NAME>
+✓ done
+```
 
-## IDs Are Strings
+## Environment variables
 
-Every ID parameter (`tweet_id`, `user_id`, `list_id`, `community_id`, `reply_to`, `quote_tweet`) is typed as a **string** in the tool schema:
+| Variable | Default | Purpose |
+|--|--|--|
+| `SPECTRE_DB` | `~/.spectre/accounts.db` | Account pool database |
+| `SPECTRE_PROXY` | none | Global proxy (`http://user:pass@host:port`) |
+| `SPECTRE_OP_<NAME>` | built-in | Override one GraphQL query id, e.g. `SPECTRE_OP_CREATETWEET` |
+| `SPECTRE_LOG_LEVEL` | `ERROR` | `DEBUG` to see request-level logs, `OFF` for silence |
+| `TWS_HTTP_BACKEND` | `httpx` | `curl_cffi` for TLS fingerprinting on twscrape reads |
+| `TWS_TELEMETRY` | `0` | Disabled by default |
+
+## Output shapes
+
+Every read returns the same shape regardless of whether it came from GraphQL or
+twscrape:
+
+**Tweet**
+
+```json
+{
+  "id": "2121388517540716839",
+  "url": "https://x.com/elonmusk/status/2121388517540716839",
+  "text": "full text, including long-form note_tweet bodies",
+  "author_id": "44196397", "author_username": "elonmusk", "author_name": "Elon Musk",
+  "created_at": "2026-11-13T23:43:30+00:00", "lang": "en",
+  "reply_count": 4069, "retweet_count": 6618, "like_count": 60118,
+  "quote_count": 646, "view_count": 4592980, "bookmark_count": 2620,
+  "is_retweet": false, "is_quote": false, "is_reply": false,
+  "in_reply_to_id": null, "conversation_id": "2121388517540716839",
+  "media_urls": ["https://video.twimg.com/..."], "media_types": ["video"],
+  "hashtags": [], "urls": [], "mentioned_users": [],
+  "quoted_tweet_id": null, "quoted_tweet": null, "retweeted_tweet_id": null
+}
+```
+
+**User**
+
+```json
+{
+  "id": "44196397", "username": "elonmusk", "display_name": "Elon Musk",
+  "bio": "...", "location": "...", "website": "...",
+  "followers": 240919353, "following": 1425, "tweets": 112085,
+  "likes": 258295, "media_count": 4772,
+  "verified": false, "blue_verified": true,
+  "profile_image_url": "...", "banner_url": "...",
+  "created_at": "2009-06-02T20:12:29+00:00", "protected": false
+}
+```
+
+IDs are strings on the way out too — echo them back as-is.
+
+## Errors
+
+```json
+{
+  "error": "Rate limited on SearchTimeline",
+  "kind": "rate_limit",
+  "retry_after_seconds": 420,
+  "hint": "Wait 420s, or add another account (spectre add ...)."
+}
+```
+
+| `kind` | Meaning | What to do |
+|--|--|--|
+| `auth` | Cookies dead, account locked or suspended | `spectre add` again |
+| `rate_limit` | X or the local lock table says wait | wait `retry_after_seconds`, or switch accounts |
+| `permission` | X refuses for this account (Premium, privacy, blocked) | do not retry; tell the user |
+| `validation` | Bad input: wrong id, datetime, length | fix the argument |
+| `not_found` | Post/user/list gone, or a stale query id | check the id; `spectre doctor` if everything fails |
+| `upstream` | X returned something unusable | retry once, then report |
+
+## Pagination
+
+List-shaped tools return `next_cursor`; pass it back as `cursor`:
 
 ```python
-get_tweet("2111332908657148356")
+page = get_bookmarks(limit=100)
+page2 = get_bookmarks(limit=100, cursor=page["next_cursor"])
 ```
 
-X IDs are 64-bit integers (~2.1e18 for modern tweets), well past JSON's 2^53 safe-integer limit. Clients and model APIs that parse JSON numbers as IEEE-754 doubles round them silently: `2111332908657148356` becomes `2111332908657148416`, and the tool dutifully reports a perfectly good tweet as "not found or deleted". A string never round-trips through a float, so the exact ID reaches X.
+`get_followers` / `get_following` walk up to 5000 and set `truncated: true` when
+the time budget stopped them early.
 
-Accepted forms: a numeric string (`"2111332908657148356"`), a full URL (`https://x.com/user/status/2111332908657148356`), or a plain integer (backwards compatibility). Anything else fails loudly with a validation error rather than querying the wrong tweet.
+## Known limitations
 
-## Limitations
-
-- **Authenticated accounts required** — X blocks unauthenticated access
-- **Rate limited** — ~300 requests/hour/account (auto-rotation handles this)
-- **~3200 tweet cap** on user timelines (X's own limit)
-- **ToS risk** — automated access violates X's terms
-- **Cookies expire** — re-add every ~2 weeks when searches return empty
+- **Likes are private by default.** `get_user_likes` returns `[]` for most
+  accounts; that is X's setting, not a failure.
+- **Who-liked lists are restricted.** `get_favoriters` is empty on most large
+  posts.
+- **Similar posts and bookmark folders are Premium-gated.** They answer with
+  `note` or `kind: permission`.
+- **List memberships are unreliable.** X's memberships timeline returns nothing
+  for many accounts; the tool says so instead of pretending.
+- **DM history is whatever X serves the cookie session.** If a reply visible in
+  the browser is missing, X is not delivering it to this session.
+- **~3,200-post cap** on user timelines; use `search(from:… since:…)` for older.
+- **Notifications** could not be verified end-to-end: the test account has no
+  notifications at all, so only the parser is covered (fixture test). Check
+  against the web UI before trusting an empty result.

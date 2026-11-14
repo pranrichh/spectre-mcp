@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/spectre-logo.png" width="180" alt="Spectre" />
+  <img src="https://raw.githubusercontent.com/pranrichh/spectre-mcp/main/assets/spectre-logo.png" width="180" alt="Spectre" />
 </p>
 
 <h1 align="center">Spectre MCP</h1>
@@ -9,76 +9,96 @@
 </p>
 
 <p align="center">
-  104 tools · no browser · no API keys · no monthly fees
+  111 tools · no browser · no API keys · no monthly fees
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick Start</a> · <a href="docs/tools.md">Tools</a> · <a href="#why-spectre">Why Spectre?</a> · <a href="docs/safety.md">Safety</a> · <a href="docs/integrations.md">Integrations</a> · <a href="docs/reference.md">Reference</a>
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="docs/tools.md">Tools</a> ·
+  <a href="#why-spectre">Why Spectre?</a> ·
+  <a href="docs/safety.md">Safety</a> ·
+  <a href="docs/integrations.md">Integrations</a> ·
+  <a href="docs/reference.md">Reference</a>
 </p>
 
 ---
+
+Spectre is an MCP server that gives AI agents 111 tools for X/Twitter: search,
+timelines, profiles, posting, media, DMs, lists, bookmarks, communities,
+notifications, scheduled posts and account management.
+
+Under the hood it talks straight to X's internal GraphQL and REST APIs with the
+cookies you already have. No browser to boot, no Puppeteer to babysit, no DOM
+scraping that dies when the UI changes.
 
 <a id="why-spectre"></a>
 
-<p align="center">
-  <img src="assets/headers/why.svg" alt="Why Spectre?" />
-</p>
+## Why Spectre?
 
-Spectre is an MCP server that gives AI agents 104 tools for X/Twitter automation — from search and posting to DMs, lists, and communities. Under the hood, it talks directly to X's internal GraphQL and REST APIs. No browser to spin up, no Puppeteer to maintain, no DOM scraping that breaks on UI changes.
-
-| | **Spectre** | **XActions** | **twikit** |
+| | **Spectre** | Browser agents | API wrappers |
 |--|:-:|:-:|:-:|
-| **Architecture** | Direct GraphQL/REST | Puppeteer (headless browser) | Python API wrapper |
-| **Speed** | <1s per request | 3–10s (browser startup) | ~1s per request |
-| **Memory** | ~10 MB | ~200 MB+ (Chromium) | ~10 MB |
-| **MCP Server** | ✓ 104 tools | ~50 API tools | ✗ None |
-| **Account Pool** | ✓ Multi-account auto-rotation | ✗ Single auth_token | ✗ Single session |
-| **Browser Required** | ✗ Never | ✓ Always | ✗ Never |
-| **DOM Breakage Risk** | ✗ None | ~ breaks on UI changes | ✗ None |
-| **Media Upload** | ✓ Cookie-based (no API keys) | ~ requires API keys | ✗ |
-| **Lists** | ✓ Full CRUD + members + subscribe | ✗ | ✗ |
-| **Drafts & Scheduled** | ✓ Full CRUD | ~ Basic | ✗ |
-| **Bookmark Folders** | ✓ Full CRUD + timeline | ✗ | ✗ |
-| **DM Search** | ✓ All / groups / people | ✗ | ✗ |
-| **Community Notes** | ✓ Read + rate | ✗ | ✗ |
-| **Highlights** | ✓ Create, delete, get | ✗ | ✗ |
-| **Notifications** | ✓ Full timeline | ✗ | ✗ |
-| **Language** | Python | JavaScript | Python |
+| **Transport** | Direct GraphQL/REST | Headless Chromium | GraphQL (single session) |
+| **Per call** | < 1s | 3–10s (browser startup) | ~1s |
+| **Memory** | ~10 MB | 200 MB+ | ~10 MB |
+| **MCP server** | ✓ 111 tools | ad-hoc scripts | ✗ |
+| **Account pool** | ✓ real rotation on 429 | ✗ | ✗ |
+| **Error contract** | ✓ structured `kind` + `hint` | ✗ | ✗ |
+| **Pagination** | ✓ cursors on list endpoints | ✗ | partial |
+| **Media upload** | ✓ cookie auth, no API keys | slow | needs keys |
+| **Language** | Python | JS | Python |
 
----
+What changed in 2.0, and why it matters:
+
+- **Every write verifies itself.** X answers HTTP 200 with an `errors` array
+  often enough that "no exception" means nothing. 31 GraphQL query ids had
+  silently drifted; the ones Spectre uses are now generated from X's live
+  bundles and verified against the API.
+- **Errors are structured.** `{"error", "kind", "hint"}` with `kind` in
+  `auth · rate_limit · permission · validation · not_found · upstream`, so an
+  agent can retry, switch accounts, or stop — instead of guessing.
+- **Rotation is real.** A 429 or a dead cookie parks that account and retries
+  the call on the next one.
+- **Limits are honoured.** `limit=5000` returns 5000 followers, not the first
+  page. Long walks return `truncated: true` instead of hanging.
+- **New in 2.0:** `get_me`, `get_user_by_id`, `get_users_by_ids`, `get_tweets`,
+  `get_tweet_quotes`, `download_media`, `get_rate_limits`, `get_list_info`,
+  `get_trend_locations`.
 
 <a id="quick-start"></a>
 
-<p align="center">
-  <img src="assets/headers/quickstart.svg" alt="Quick Start" />
-</p>
+## Quick Start
 
 ### 1. Install
 
 ```bash
-pipx install spectre-mcp    # or: uv tool install spectre-mcp
+pipx install spectre-mcp     # or: uv tool install spectre-mcp
 ```
 
-### 2. Add Your X Account
+### 2. Add your X account
 
-Extract cookies from your browser:
+Log into x.com, open DevTools (`F12`) → **Application** → **Cookies** →
+`https://x.com`, and copy two values:
 
-1. Open **x.com** and make sure you're logged in
-2. Open **DevTools** (`F12` or `Ctrl+Shift+I`)
-3. Go to **Storage** → **Cookies** → select **`https://x.com`**
-4. Find and copy these two values:
-   - **`auth_token`** — long hex string (e.g. `a1b2c3d4...`)
-   - **`ct0`** — 160-character hex string
+| Cookie | Looks like |
+|--|--|
+| `auth_token` | a long hex string |
+| `ct0` | exactly 160 hex characters |
 
 ```bash
-spectre add myaccount "auth_token=a1b2c3d4...; ct0=e5f6a7b8..."
+spectre add myaccount "auth_token=...; ct0=..."
 ```
 
-> **Tip:** `ct0` is exactly 160 hex characters. Double-check you copied the full value — partial cookies will fail silently.
+Spectre checks the cookies against X before saving and stores the account's
+**real** handle — so a renamed account still works. Bad cookies are rejected on
+the spot instead of failing silently weeks later.
 
-### 3. Configure Your MCP Client
+```bash
+spectre list      # accounts and their state
+spectre status    # pool health
+spectre doctor    # auth + operation-table check
+```
 
-Add to your MCP client config (`~/.hermes/config.yaml`, `claude_desktop_config.json`, `.cursor/mcp.json`, or equivalent):
+### 3. Point your MCP client at it
 
 ```json
 {
@@ -91,33 +111,78 @@ Add to your MCP client config (`~/.hermes/config.yaml`, `claude_desktop_config.j
 }
 ```
 
-For client-specific setup (Hermes skill, Claude, Cursor, Python), see [Integrations](docs/integrations.md).
+Works with Hermes (`~/.hermes/config.yaml`), Claude Desktop
+(`claude_desktop_config.json`), Cursor (`.cursor/mcp.json`) — see
+[Integrations](docs/integrations.md).
 
-> **No `uv`?** Install it: `curl -LsSf https://astral.sh/uv/install.sh | sh`
-> Or use `python3 -m spectre.server` to run from a local clone.
+### 4. Call a tool
 
-### 4. Call a Tool — IDs Are Strings
-
-Every tool that takes an X ID (`tweet_id`, `user_id`, `list_id`, `community_id`, `reply_to`, `quote_tweet`) takes it as a **string**:
+IDs are **strings** (or full `https://x.com/...` URLs), never JSON numbers:
 
 ```python
-get_tweet("2111332908657148356")
+get_me()                                    # which account is live
+search("mcp server", limit=20, mode="latest")
+get_user("elonmusk")                        # -> id for follow/block/DM
+post_tweet("hello from an agent")
 ```
 
-X IDs are 64-bit integers. Most MCP clients and model APIs parse JSON numbers as IEEE-754 doubles, which rounds anything above 2^53 — `2111332908657148356` silently becomes `2111332908657148416`, and the tool reports a perfectly good tweet as "not found or deleted". Passing the ID as a string removes the round-trip entirely, so the server sees the exact ID the model meant. A full `https://x.com/...` URL works too, and a plain integer is still accepted for backwards compatibility.
+X IDs are 64-bit and overflow the IEEE-754 safe range (2^53). A client that
+parses JSON numbers as doubles turns `2111332908657148356` into
+`2111332908657148416` and the tool reports a perfectly good post as "not
+found". Strings never round-trip through a float.
 
 ---
 
-<p align="center">
-  <img src="assets/headers/reference.svg" alt="Reference" />
-</p>
+## What's in the box
 
-- [All 104 Tools](docs/tools.md) — every tool, grouped by feature
-- [Integrations](docs/integrations.md) — Hermes, Claude, Cursor, Python
-- [Safety](docs/safety.md) — destructive tools, rate limits
-- [Reference](docs/reference.md) — X query operators, CLI, env vars, limitations
+| Area | Tools |
+|--|--|
+| Accounts | `get_me`, `list_accounts`, `pool_status`, `set_active_account`, `set_auto_rotate`, `get_rate_limits`, `remove_account` |
+| Search | `search` (full operator syntax), `search_users` |
+| Profiles | `get_user`, `get_user_by_id`, `get_users_by_ids`, `get_user_tweets`, `get_user_tweets_and_replies`, `get_user_media`, `get_followers`, `get_following`, `get_verified_followers`, `get_followers_you_know`, `get_user_likes`, `get_user_highlights` |
+| Posts | `get_tweet`, `get_tweets`, `get_tweet_replies`, `get_thread`, `get_tweet_quotes`, `get_retweeters`, `get_favoriters`, `get_tweet_edit_history`, `get_similar_posts`, `get_community_notes` |
+| Compose | `post_tweet`, `delete_tweet`, `upload_media`, `download_media`, `schedule_tweet` (+CRUD), `create_draft` (+CRUD) |
+| Engagement | `like_tweet`, `unlike_tweet`, `retweet`, `unretweet`, `bookmark_tweet`, `unbookmark_tweet`, `pin_tweet`, `unpin_tweet`, `pin_reply`, `unpin_reply` |
+| Social | `follow_user`, `unfollow_user`, `mute_user`, `unmute_user`, `block_user`, `unblock_user`, `remove_follower`, `get_muted_accounts`, `get_blocked_accounts` |
+| DMs | `send_dm`, `get_dm_inbox`, `get_dm_conversation`, `search_dm`, `search_dm_groups`, `search_dm_people`, `get_dm_muted`, `dm_block_user`, `dm_unblock_user` |
+| Lists | `get_list_info`, `create_list`, `update_list`, `delete_list`, `add_list_member`, `remove_list_member`, `get_list_members`, `get_list_timeline`, `get_list_subscribers`, `get_list_memberships`, `get_list_ownerships`, `subscribe_list`, `unsubscribe_list` |
+| Communities & topics | `get_community_info`, `get_community_tweets`, `join_community`, `leave_community`, `get_topic_info`, `follow_topic`, `unfollow_topic`, `get_trends`, `get_trend_locations` |
+| Bookmarks | `get_bookmarks`, `search_bookmarks`, `clear_all_bookmarks`, folder CRUD + folder timeline |
+| Notifications | `get_notifications`, `get_home_timeline` |
+| Profile | `get_account_settings`, `update_profile`, `update_profile_image`, `update_profile_banner`, `delete_profile_banner`, `rate_community_note` |
+
+Full reference with arguments and gotchas: **[docs/tools.md](docs/tools.md)**.
 
 ---
+
+## Safety
+
+Posting, DMs, follows, blocks, deletes and profile edits are public and mostly
+irreversible. Spectre labels them in [docs/safety.md](docs/safety.md); the
+agent-side rule is simple: **confirm with the user before any write.**
+
+Rate limits are per account (~50 searches / 15 min, ~300 requests / 15 min on
+reads). The pool rotates automatically; `get_rate_limits()` tells you when the
+next window opens.
+
+Automated access violates X's Terms of Service. You are responsible for the
+account you point this at.
+
+## Development
+
+```bash
+git clone https://github.com/pranrichh/spectre-mcp
+cd spectre-mcp
+uv sync
+.venv/bin/python tools/gen_docs.py --check    # fails if docs/tools.md drifted
+.venv/bin/python -m pytest tests -q             # parser tests
+.venv/bin/python tools/update_ops.py GraphQL.json   # refresh query ids
+```
+
+Query ids drift every few weeks. `tools/update_ops.py` regenerates
+`src/spectre/ops.py` from
+[fa0311/TwitterInternalAPIDocument](https://github.com/fa0311/TwitterInternalAPIDocument);
+`SPECTRE_OP_<NAME>` overrides a single operation at runtime.
 
 ## License
 

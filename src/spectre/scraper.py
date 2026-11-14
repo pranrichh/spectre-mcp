@@ -1,397 +1,363 @@
-"""Spectre — X/Twitter scraper engine with account pool management."""
+"""Timeline/search reads on top of twscrape, normalised to Spectre's shapes.
+
+twscrape is good at the awkward paginated read endpoints (search, timelines,
+follower pages) and bad at surfacing why something came back empty. This module
+wraps it so that:
+
+* the requested `limit` is the number of items returned — twscrape happily yields
+  a whole page regardless of the limit you ask for;
+* a long walk stops on a time budget with `truncated: true` instead of hanging;
+* every result is the same dict shape the GraphQL layer returns.
+"""
 
 from __future__ import annotations
+
 import asyncio
-import os
+import time
+from datetime import datetime
 from typing import AsyncIterator, Optional
+
 from twscrape import API, AccountsPool
-from loguru import logger
 
-from spectre.models import Tweet, UserProfile, Trend, CommunityInfo, AccountStatus
+from spectre.errors import XError
+from spectre.parse import iso_time, sid
 
 
-def _tweet_to_model(tw) -> Tweet:
-    """Convert a raw Tweet to our Pydantic model."""
-    media_urls = []
-    media_types = []
-    if tw.media:
-        for p in tw.media.photos:
-            media_urls.append(p.url)
-            media_types.append("photo")
-        for v in tw.media.videos:
-            if v.variants:
-                best = max(v.variants, key=lambda x: getattr(x, "bitrate", 0) or 0)
-                media_urls.append(best.url)
+def _best_video(variants) -> Optional[str]:
+    mp4 = [v for v in variants or [] if getattr(v, "contentType", "").startswith("video/")]
+    if not mp4:
+        return None
+    return max(mp4, key=lambda v: getattr(v, "bitrate", 0) or 0).url
+
+
+def tweet_dict(tw) -> dict:
+    """twscrape Tweet -> Spectre tweet shape."""
+    if tw is None:
+        return {}
+    user = getattr(tw, "user", None)
+    media_urls, media_types = [], []
+    media = getattr(tw, "media", None)
+    if media:
+        for photo in getattr(media, "photos", []) or []:
+            if photo.url:
+                media_urls.append(photo.url)
+                media_types.append("photo")
+        for video in getattr(media, "videos", []) or []:
+            url = _best_video(getattr(video, "variants", []))
+            if url:
+                media_urls.append(url)
                 media_types.append("video")
-        for a in tw.media.animated:
-            if a.videoUrl:
-                media_urls.append(a.videoUrl)
+        for gif in getattr(media, "animated", []) or []:
+            if getattr(gif, "videoUrl", None):
+                media_urls.append(gif.videoUrl)
                 media_types.append("animated_gif")
 
-    hashtags = []
+    quoted = getattr(tw, "quotedTweet", None)
+    retweeted = getattr(tw, "retweetedTweet", None)
+    link_objs = getattr(tw, "links", []) or []
     urls = []
-    mentioned = []
-    if tw.hashtags:
-        hashtags = tw.hashtags
-    if tw.links:
-        urls = [l.url for l in tw.links if hasattr(l, 'url')]
-    if tw.mentionedUsers:
-        mentioned = [u.screenName if hasattr(u, 'screenName') else str(u) for u in tw.mentionedUsers]
+    for link in link_objs:
+        url = getattr(link, "url", None)
+        if url:
+            urls.append(url)
+    return {
+        "id": sid(tw.id),
+        "url": getattr(tw, "url", None),
+        "text": getattr(tw, "rawContent", "") or "",
+        "author_id": sid(getattr(user, "id", None)),
+        "author_username": getattr(user, "username", None),
+        "author_name": getattr(user, "displayname", None),
+        "created_at": iso_time(getattr(tw, "date", None)),
+        "lang": getattr(tw, "lang", None),
+        "reply_count": getattr(tw, "replyCount", 0) or 0,
+        "retweet_count": getattr(tw, "retweetCount", 0) or 0,
+        "like_count": getattr(tw, "likeCount", 0) or 0,
+        "quote_count": getattr(tw, "quoteCount", 0) or 0,
+        "view_count": getattr(tw, "viewCount", 0) or 0,
+        "bookmark_count": getattr(tw, "bookmarkedCount", 0) or 0,
+        "is_retweet": retweeted is not None,
+        "is_quote": quoted is not None,
+        "is_reply": getattr(tw, "inReplyToTweetId", None) is not None,
+        "in_reply_to_id": sid(getattr(tw, "inReplyToTweetId", None)),
+        "conversation_id": sid(getattr(tw, "conversationId", None)),
+        "media_urls": media_urls,
+        "media_types": media_types,
+        "hashtags": list(getattr(tw, "hashtags", []) or []),
+        "urls": urls,
+        "mentioned_users": [getattr(u, "username", None) for u in (getattr(tw, "mentionedUsers", []) or []) if getattr(u, "username", None)],
+        "quoted_tweet_id": sid(getattr(quoted, "id", None)),
+        "quoted_tweet": getattr(quoted, "rawContent", None),
+        "retweeted_tweet_id": sid(getattr(retweeted, "id", None)),
+    }
 
-    return Tweet(
-        id=tw.id,
-        url=f"https://x.com/{tw.user.username}/status/{tw.id}" if tw.user else "",
-        text=tw.rawContent or "",
-        author_username=tw.user.username if tw.user else "",
-        author_name=tw.user.displayname if tw.user else "",
-        created_at=tw.date.isoformat() if tw.date else "",
-        lang=tw.lang,
-        reply_count=tw.replyCount or 0,
-        retweet_count=tw.retweetCount or 0,
-        like_count=tw.likeCount or 0,
-        quote_count=tw.quoteCount or 0,
-        view_count=tw.viewCount or 0,
-        bookmark_count=getattr(tw, 'bookmarkedCount', 0) or 0,
-        is_retweet=tw.retweetedTweet is not None,
-        is_quote=tw.quotedTweet is not None,
-        is_reply=tw.inReplyToTweetId is not None,
-        media_urls=media_urls,
-        media_types=media_types,
-        hashtags=hashtags,
-        urls=urls,
-        mentioned_users=mentioned,
-        quoted_tweet=tw.quotedTweet.rawContent if tw.quotedTweet else None,
-        in_reply_to_id=tw.inReplyToTweetId,
-        conversation_id=tw.conversationId,
-    )
+
+def user_dict(u) -> dict:
+    """twscrape User -> Spectre user shape."""
+    if u is None:
+        return {}
+    website = getattr(u, "url", None)
+    links = getattr(u, "descriptionLinks", None) or []
+    if links:
+        website = getattr(links[0], "url", website)
+    return {
+        "id": sid(getattr(u, "id", None)),
+        "username": getattr(u, "username", None),
+        "display_name": getattr(u, "displayname", None),
+        "bio": getattr(u, "rawDescription", None),
+        "location": getattr(u, "location", None) or None,
+        "website": website,
+        "followers": getattr(u, "followersCount", 0) or 0,
+        "following": getattr(u, "friendsCount", 0) or 0,
+        "tweets": getattr(u, "statusesCount", 0) or 0,
+        "likes": getattr(u, "favouritesCount", 0) or 0,
+        "media_count": getattr(u, "mediaCount", 0) or 0,
+        "verified": bool(getattr(u, "verified", False)),
+        "blue_verified": bool(getattr(u, "blue", False)),
+        "profile_image_url": getattr(u, "profileImageUrl", None),
+        "banner_url": getattr(u, "profileBannerUrl", None),
+        "created_at": iso_time(getattr(u, "created", None)),
+        "protected": bool(getattr(u, "protected", False)),
+    }
 
 
-def _user_to_model(u) -> UserProfile:
-    """Convert a raw User to our Pydantic model."""
-    return UserProfile(
-        id=u.id,
-        username=u.username,
-        display_name=u.displayname,
-        bio=u.rawDescription if hasattr(u, "rawDescription") else (u.bio if hasattr(u, "bio") else None),
-        location=u.location if hasattr(u, "location") else None,
-        website=u.url if hasattr(u, "url") else None,
-        followers=u.followersCount or 0,
-        following=u.friendsCount or 0,
-        tweets=u.statusesCount or 0,
-        likes=u.favouritesCount or 0,
-        media_count=u.mediaCount or 0,
-        verified=u.verified or False,
-        blue_verified=u.blue if hasattr(u, "blue") else False,
-        profile_image_url=u.profileImageUrl if hasattr(u, "profileImageUrl") else None,
-        banner_url=u.profileBannerUrl if hasattr(u, "profileBannerUrl") else None,
-        created_at=u.created.isoformat() if hasattr(u, "created") and u.created else None,
-    )
+async def _take(gen: AsyncIterator, limit: int, deadline: float) -> tuple[list, bool]:
+    """Consume at most `limit` items, never blocking past the deadline.
+
+    twscrape's generators sleep while their account pool waits for a rate-limit
+    window, so a plain `async for` can hang for hours. Waiting per item with the
+    remaining budget turns that into "partial results, truncated=True".
+    """
+    items: list = []
+    iterator = gen.__aiter__()
+    while len(items) < limit:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return items, True
+        try:
+            item = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
+        except StopAsyncIteration:
+            return items, False
+        except asyncio.TimeoutError:
+            return items, True
+        items.append(item)
+    return items, False
 
 
 class Scraper:
-    """Async X/Twitter scraper with account pool management.
+    """Paginated reads through twscrape, sharing the caller's account pool."""
 
-    Manages multiple authenticated accounts for automatic rotation on rate limits.
-    Each account uses cookie-based auth (auth_token + ct0 from browser DevTools).
-    """
-
-    def __init__(self, db_path: Optional[str] = None, proxy: Optional[str] = None):
-        self.db_path = db_path or os.path.join(os.path.expanduser("~"), ".spectre", "accounts.db")
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+    def __init__(self, pool: AccountsPool, proxy: Optional[str] = None, default_budget: float = 90.0):
+        self._pool = pool
         self.proxy = proxy
+        self.default_budget = default_budget
         self._api: Optional[API] = None
 
-    def _sanitize_db(self) -> None:
-        """Fix known twscrape DB issues that crash the server.
-
-        - last_used='0' causes datetime.fromisoformat('0') crash in twscrape.
-          Set to NULL so twscrape's `if doc['last_used']` check skips it.
-        """
-        import sqlite3
-        try:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute("UPDATE accounts SET last_used = NULL WHERE last_used = '0' OR last_used = 0")
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass  # DB may not exist yet
-
-    async def _get_api(self) -> API:
+    async def api(self) -> API:
         if self._api is None:
-            self._sanitize_db()
-            pool = AccountsPool(self.db_path)
-            self._api = API(pool, proxy=self.proxy)
+            self._api = API(self._pool, proxy=self.proxy)
         return self._api
 
-    async def close(self):
-        if self._api:
-            await self._api.pool.close()
-            self._api = None
+    async def close(self) -> None:
+        # twscrape's AccountsPool has no close(); drop the reference so the
+        # connection is garbage collected with the pool the server owns.
+        self._api = None
 
-    # ── Account Pool Management ──
 
-    async def add_account_cookies(self, username: str, cookies: str) -> str:
-        """Add an account using browser cookies (auth_token=xxx; ct0=yyy)."""
-        api = await self._get_api()
-        await api.pool.add_account_cookies(username, cookies)
-        return f"Account @{username} added to pool."
+    async def _ensure_available(self, queue: str) -> None:
+        """Fail fast when every account is locked for this queue.
 
-    async def list_accounts(self) -> list[dict]:
-        """List all accounts with their status and metadata."""
-        api = await self._get_api()
-        accounts = []
-        all_accounts = await api.pool.get_all()
-        for acc in all_accounts:
-            if acc.active and not acc.error_msg:
-                state = "active"
-            elif acc.error_msg:
-                state = "error"
-            else:
-                state = "locked"
-            accounts.append({
-                "username": acc.username,
-                "state": state,
-                "error": acc.error_msg,
-                "proxy": acc.proxy if hasattr(acc, "proxy") and acc.proxy else None,
-            })
-        return accounts
-
-    async def set_active_account(self, username: str) -> str:
-        """Set a specific account as the primary (first in rotation).
-
-        Moves the account to the front of the pool so it's picked first.
+        twscrape implements waits by sleeping inside the generator, so without
+        this a rate-limited search blocks the tool for minutes. Reading the lock
+        table first turns that into an immediate, actionable error.
         """
-        api = await self._get_api()
-        all_accounts = await api.pool.get_all()
-        target = None
-        for acc in all_accounts:
-            if acc.username == username:
-                target = acc
-                break
-        if not target:
-            available = [a.username for a in all_accounts]
-            return f"Account @{username} not found. Available: {', '.join('@' + u for u in available)}"
-        if not target.active or target.error_msg:
-            return f"Account @{username} is {('errored: ' + target.error_msg) if target.error_msg else 'locked/inactive'}. Cannot set as primary."
+        accounts = await self._pool.get_all()
+        if not accounts:
+            raise XError("No accounts in the pool.", kind="auth")
+        waits: list[int] = []
+        for account in accounts:
+            locks = account.locks if isinstance(account.locks, dict) else {}
+            until = locks.get(queue)
+            if not until:
+                return
+            try:
+                unlock_at = datetime.fromisoformat(str(until).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return
+            remaining = int(unlock_at - time.time())
+            if remaining <= 0:
+                return
+            waits.append(remaining)
+        if waits:
+            retry = min(waits)
+            raise XError(
+                f"All accounts are rate limited for {queue}.",
+                kind="rate_limit",
+                retry_after=retry,
+                hint=f"Wait {retry}s, or add another account (spectre add ...).",
+            )
 
-        # Reset last_used to 0 so twscrape picks this account first (LRU rotation)
-        try:
-            from twscrape.db import execute
-            db_file = api.pool._db_file
-            await execute(db_file, "UPDATE accounts SET last_used = NULL, locks = '{}', error_msg = NULL WHERE username = :username", {"username": username})
-            return f"Account @{username} set as primary. It will be used first for all operations."
-        except Exception as e:
-            return f"Failed to set @{username} as primary: {e}"
+    # ── lookups ──
 
-    async def remove_account(self, username: str) -> str:
-        """Remove an account from the pool."""
-        api = await self._get_api()
-        try:
-            await api.pool.delete_accounts([username])
-            return f"Account @{username} removed from pool."
-        except Exception as e:
-            return f"Failed to remove @{username}: {e}"
-
-    async def pool_status(self) -> AccountStatus:
-        """Get account pool health."""
-        api = await self._get_api()
-        accounts = []
-        active = locked = error = 0
-        total = 0
-        all_accounts = await api.pool.get_all()
-        for acc in all_accounts:
-            total += 1
-            if acc.active and not acc.error_msg:
-                state = "active"
-                active += 1
-            elif acc.error_msg:
-                state = "error"
-                error += 1
-            else:
-                state = "locked"
-                locked += 1
-            accounts.append({"username": acc.username, "state": state, "error": acc.error_msg})
-        return AccountStatus(total=total, active=active, locked=locked, error=error, accounts=accounts)
-
-    # ── Search ──
-
-    async def search(self, query: str, limit: int = 20, mode: str = "latest") -> list[Tweet]:
-        """Search tweets. mode: 'latest', 'top', or 'media'."""
-        api = await self._get_api()
-        kv = {"product": mode.capitalize()} if mode in ("latest", "top") else {"product": "Media"}
-        results = []
-        async for tw in api.search(query, limit=limit, kv=kv):
-            results.append(_tweet_to_model(tw))
-        return results
-
-    async def search_users(self, query: str, limit: int = 10) -> list[UserProfile]:
-        """Search for users by query."""
-        api = await self._get_api()
-        results = []
-        async for u in api.search_user(query, limit=limit):
-            results.append(_user_to_model(u))
-        return results
-
-    # ── Users ──
-
-    async def get_user(self, username: str) -> Optional[UserProfile]:
-        """Get user profile by @handle."""
-        api = await self._get_api()
-        u = await api.user_by_login(username)
-        return _user_to_model(u) if u else None
-
-    async def get_user_tweets(self, username: str, limit: int = 20) -> list[Tweet]:
-        """Get user's recent tweets."""
-        api = await self._get_api()
-        user = await api.user_by_login(username)
+    async def _user(self, username: str):
+        api = await self.api()
+        user = await api.user_by_login(username.lstrip("@"))
         if not user:
-            return []
-        results = []
-        async for tw in api.user_tweets(user.id, limit=limit):
-            results.append(_tweet_to_model(tw))
-        return results
+            raise XError(f"User @{username} not found.", kind="not_found", code=50)
+        return user
 
-    async def get_user_media(self, username: str, limit: int = 20) -> list[Tweet]:
-        """Get user's media tweets (photos/videos)."""
-        api = await self._get_api()
-        user = await api.user_by_login(username)
+    async def user(self, username: str) -> dict:
+        await self._ensure_available("UserByScreenName")
+        return user_dict(await self._user(username))
+
+    async def user_by_id(self, user_id: str) -> dict:
+        await self._ensure_available("UserByRestId")
+        api = await self.api()
+        user = await api.user_by_id(str(user_id))
         if not user:
-            return []
-        results = []
-        async for tw in api.user_media(user.id, limit=limit):
-            results.append(_tweet_to_model(tw))
-        return results
+            raise XError(f"No user with id {user_id}.", kind="not_found", code=50)
+        return user_dict(user)
 
-    async def get_followers(self, username: str, limit: int = 20) -> list[UserProfile]:
-        """Get user's followers."""
-        api = await self._get_api()
-        user = await api.user_by_login(username)
-        if not user:
-            return []
-        results = []
-        async for u in api.followers(user.id, limit=limit):
-            results.append(_user_to_model(u))
-        return results
+    # ── search ──
 
-    async def get_following(self, username: str, limit: int = 20) -> list[UserProfile]:
-        """Get who the user follows."""
-        api = await self._get_api()
-        user = await api.user_by_login(username)
-        if not user:
-            return []
-        results = []
-        async for u in api.following(user.id, limit=limit):
-            results.append(_user_to_model(u))
-        return results
+    async def search(self, query: str, limit: int = 20, mode: str = "latest") -> list[dict]:
+        await self._ensure_available("SearchTimeline")
+        api = await self.api()
+        product = {"latest": "Latest", "top": "Top", "media": "Media"}.get(mode.lower())
+        if not product:
+            raise XError('mode must be "latest", "top" or "media".', kind="validation")
+        kv = {"product": product}
+        if mode == "media":
+            kv["with_tweet_replies"] = False
+        deadline = time.monotonic() + self.default_budget
+        tweets, truncated = await _take(api.search(query, limit=limit, kv=kv), limit, deadline)
+        if truncated and not tweets:
+            raise XError(
+                "No response from X before the time budget ran out.",
+                kind="rate_limit",
+                hint="The account is probably locked or rate limited — check pool_status / get_rate_limits.",
+            )
+        return [tweet_dict(t) for t in tweets]
 
-    # ── Tweets ──
+    async def search_users(self, query: str, limit: int = 10) -> list[dict]:
+        await self._ensure_available("SearchTimeline")
+        api = await self.api()
+        deadline = time.monotonic() + self.default_budget
+        users, _ = await _take(api.search_user(query, limit=limit), limit, deadline)
+        return [user_dict(u) for u in users]
 
-    async def get_tweet(self, tweet_id: int) -> Optional[Tweet]:
-        """Get single tweet by ID."""
-        api = await self._get_api()
-        tw = await api.tweet_details(tweet_id)
-        return _tweet_to_model(tw) if tw else None
+    # ── timelines ──
 
-    async def get_tweet_replies(self, tweet_id: int, limit: int = 20) -> list[Tweet]:
-        """Get replies to a tweet."""
-        api = await self._get_api()
-        results = []
-        async for tw in api.tweet_replies(tweet_id, limit=limit):
-            results.append(_tweet_to_model(tw))
-        return results
-
-    async def get_thread(self, tweet_id: int, limit: int = 50) -> list[Tweet]:
-        """Get full conversation thread."""
-        api = await self._get_api()
-        results = []
-        async for tw in api.tweet_thread(tweet_id, limit=limit):
-            results.append(_tweet_to_model(tw))
-        return results
-
-    async def get_retweeters(self, tweet_id: int, limit: int = 20) -> list[UserProfile]:
-        """Get users who retweeted a tweet."""
-        api = await self._get_api()
-        results = []
-        async for u in api.retweeters(tweet_id, limit=limit):
-            results.append(_user_to_model(u))
-        return results
-
-    # ── Trends ──
-
-    async def get_trends(self, category: str = "trending", limit: int = 20) -> list[Trend]:
-        """Get trending topics. Categories: 'trending', 'news', 'sport', 'entertainment'."""
-        api = await self._get_api()
-        results = []
-        async for tr in api.trends(category, limit=limit):
-            results.append(Trend(
-                name=tr.name if hasattr(tr, "name") else str(tr),
-                tweet_count=tr.tweetCount if hasattr(tr, "tweetCount") else None,
-                category=getattr(tr, "category", None),
-            ))
-        return results
-
-    # ── Lists ──
-
-    async def get_list_timeline(self, list_id: int, limit: int = 20) -> list[Tweet]:
-        """Get tweets from a list."""
-        api = await self._get_api()
-        results = []
-        async for tw in api.list_timeline(list_id, limit=limit):
-            results.append(_tweet_to_model(tw))
-        return results
-
-    async def get_list_members(self, list_id: int, limit: int = 20) -> list[UserProfile]:
-        """Get members of a list."""
-        api = await self._get_api()
-        results = []
-        async for u in api.list_members(list_id, limit=limit):
-            results.append(_user_to_model(u))
-        return results
-
-    # ── Communities ──
-
-    async def get_community_tweets(self, community_id: int, limit: int = 20) -> list[Tweet]:
-        """Get tweets from a community."""
-        api = await self._get_api()
-        results = []
-        async for tw in api.community_tweets(community_id, limit=limit):
-            results.append(_tweet_to_model(tw))
-        return results
-
-    async def get_community_info(self, community_id: int) -> Optional[CommunityInfo]:
-        """Get community details."""
-        api = await self._get_api()
-        c = await api.community_info(community_id)
-        if not c:
-            return None
-        return CommunityInfo(
-            id=c.id,
-            name=c.name,
-            description=getattr(c, "description", None),
-            member_count=getattr(c, "memberCount", 0),
-            created_at=c.created.isoformat() if hasattr(c, "created") and c.created else None,
+    async def user_tweets(self, username: str, limit: int = 20, replies: bool = False, media_only: bool = False) -> dict:
+        await self._ensure_available("UserMedia" if media_only else ("UserTweetsAndReplies" if replies else "UserTweets"))
+        api = await self.api()
+        user = await self._user(username)
+        gen = api.user_media(user.id, limit=limit) if media_only else (
+            api.user_tweets_and_replies(user.id, limit=limit) if replies else api.user_tweets(user.id, limit=limit)
         )
+        deadline = time.monotonic() + self.default_budget
+        tweets, truncated = await _take(gen, limit, deadline)
+        return {"tweets": [tweet_dict(t) for t in tweets], "count": len(tweets), "truncated": truncated}
 
-    # ── Bookmarks ──
+    async def followers(self, username: str, limit: int = 20) -> dict:
+        return await self._connections(username, limit, followers=True)
 
-    async def get_bookmarks(self, limit: int = 20) -> list[Tweet]:
-        """Get authenticated user's bookmarks."""
-        api = await self._get_api()
-        results = []
-        async for tw in api.bookmarks(limit=limit):
-            results.append(_tweet_to_model(tw))
-        return results
+    async def following(self, username: str, limit: int = 20) -> dict:
+        return await self._connections(username, limit, followers=False)
 
-    # ── Home Timeline ──
+    async def _connections(self, username: str, limit: int, followers: bool) -> dict:
+        await self._ensure_available("Followers" if followers else "Following")
+        api = await self.api()
+        user = await self._user(username)
+        gen = api.followers(user.id, limit=limit) if followers else api.following(user.id, limit=limit)
+        deadline = time.monotonic() + max(self.default_budget, min(300.0, limit / 4))
+        users, truncated = await _take(gen, limit, deadline)
+        return {
+            "users": [user_dict(u) for u in users],
+            "count": len(users),
+            "truncated": truncated,
+            "total_available": getattr(user, "followersCount", None) if followers else getattr(user, "friendsCount", None),
+        }
 
-    async def get_home_timeline(self, limit: int = 20) -> list[Tweet]:
-        """Get the authenticated user's home timeline."""
-        api = await self._get_api()
-        results = []
-        try:
-            async for tw in api.home_timeline(limit=limit):
-                results.append(_tweet_to_model(tw))
-        except AttributeError:
-            # twscrape may not have home_timeline — fall back to search
-            logger.warning("home_timeline not available in this version, falling back to search")
-        return results
+    async def verified_followers(self, user_id: str, limit: int = 20) -> dict:
+        await self._ensure_available("BlueVerifiedFollowers")
+        api = await self.api()
+        deadline = time.monotonic() + self.default_budget
+        users, truncated = await _take(api.verified_followers(int(user_id), limit=limit), limit, deadline)
+        return {"users": [user_dict(u) for u in users], "count": len(users), "truncated": truncated}
+
+    # ── conversations ──
+
+    async def tweet(self, tweet_id: str) -> dict:
+        await self._ensure_available("TweetDetail")
+        api = await self.api()
+        tw = await api.tweet_details(int(tweet_id))
+        if not tw:
+            raise XError(f"Tweet {tweet_id} not found.", kind="not_found", code=144)
+        return tweet_dict(tw)
+
+    async def replies(self, tweet_id: str, limit: int = 20) -> dict:
+        await self._ensure_available("TweetDetail")
+        api = await self.api()
+        deadline = time.monotonic() + self.default_budget
+        tweets, truncated = await _take(api.tweet_replies(int(tweet_id), limit=limit), limit, deadline)
+        return {"tweets": [tweet_dict(t) for t in tweets], "count": len(tweets), "truncated": truncated}
+
+    async def thread(self, tweet_id: str, limit: int = 50) -> dict:
+        await self._ensure_available("TweetDetail")
+        api = await self.api()
+        deadline = time.monotonic() + self.default_budget
+        tweets, truncated = await _take(api.tweet_thread(int(tweet_id), limit=limit), limit, deadline)
+        return {"tweets": [tweet_dict(t) for t in tweets], "count": len(tweets), "truncated": truncated}
+
+    async def retweeters(self, tweet_id: str, limit: int = 20) -> dict:
+        await self._ensure_available("Retweeters")
+        api = await self.api()
+        deadline = time.monotonic() + self.default_budget
+        users, truncated = await _take(api.retweeters(int(tweet_id), limit=limit), limit, deadline)
+        return {"users": [user_dict(u) for u in users], "count": len(users), "truncated": truncated}
+
+    # ── lists & communities ──
+
+    async def list_timeline(self, list_id: str, limit: int = 20) -> dict:
+        await self._ensure_available("ListLatestTweetsTimeline")
+        api = await self.api()
+        deadline = time.monotonic() + self.default_budget
+        tweets, truncated = await _take(api.list_timeline(int(list_id), limit=limit), limit, deadline)
+        return {"tweets": [tweet_dict(t) for t in tweets], "count": len(tweets), "truncated": truncated}
+
+    async def list_members(self, list_id: str, limit: int = 20) -> dict:
+        await self._ensure_available("ListMembers")
+        api = await self.api()
+        deadline = time.monotonic() + self.default_budget
+        users, truncated = await _take(api.list_members(int(list_id), limit=limit), limit, deadline)
+        return {"users": [user_dict(u) for u in users], "count": len(users), "truncated": truncated}
+
+    async def community_tweets(self, community_id: str, limit: int = 20) -> dict:
+        await self._ensure_available("CommunityTweetsTimeline")
+        api = await self.api()
+        deadline = time.monotonic() + self.default_budget
+        tweets, truncated = await _take(api.community_tweets(int(community_id), limit=limit), limit, deadline)
+        return {"tweets": [tweet_dict(t) for t in tweets], "count": len(tweets), "truncated": truncated}
+
+    async def community_info(self, community_id: str) -> dict:
+        api = await self.api()
+        info = await api.community_info(int(community_id))
+        if not info:
+            raise XError(f"Community {community_id} not found.", kind="not_found")
+        return {
+            "community_id": sid(getattr(info, "id", community_id)),
+            "name": getattr(info, "name", None),
+            "description": getattr(info, "description", None),
+            "member_count": getattr(info, "memberCount", 0) or 0,
+            "created_at": iso_time(getattr(info, "created", None)),
+            "admin_ids": [sid(a) for a in (getattr(info, "adminIds", None) or [])],
+        }
+
+    # ── bookmarks ──
+
+    async def bookmarks(self, limit: int = 20) -> dict:
+        await self._ensure_available("Bookmarks")
+        api = await self.api()
+        deadline = time.monotonic() + self.default_budget
+        tweets, truncated = await _take(api.bookmarks(limit=limit), limit, deadline)
+        return {"tweets": [tweet_dict(t) for t in tweets], "count": len(tweets), "truncated": truncated}

@@ -28,3 +28,7 @@ Thumbs.db
 # Env
 .env
 .env.local
+
+# Local work dirs (probes, logs, verification output)
+.work/
+.pytest_cache/

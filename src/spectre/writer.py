@@ -1,432 +1,302 @@
-"""Write operations for X/Twitter via GraphQL mutations and REST API.
+"""Read and write operations against X/Twitter.
 
-Handles all write operations (post, like, retweet, bookmark, follow, etc.)
-using the same cookie-based auth as read operations. No OAuth 1.0a needed.
+Two rules this module exists to enforce:
+
+1. A tool never reports success it did not observe. X answers HTTP 200 with an
+   `errors` array often enough that "no exception" means nothing; every mutation
+   checks the payload for the object it asked X to change.
+2. Every failure is an `XError` -> `{"error", "kind", "hint"}`, so an agent can
+   tell "rate limited, wait" from "wrong id" from "cookies expired".
+
+Reads that GraphQL does not expose cleanly (search, timelines, threads) live in
+`scraper.py` on top of twscrape; everything here is direct GraphQL/REST.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import os
-from typing import Optional
+import mimetypes
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Optional
 
-import httpx
 from loguru import logger
 
-# X's web app bearer token (public, embedded in the JS bundle)
-BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
-GQL_URL = "https://x.com/i/api/graphql"
-
-# Default feature flags required by most GraphQL operations
-DEFAULT_FEATURES = {
-    "c9s_tweet_anatomy_moderator_badge_enabled": True,
-    "responsive_web_home_pinned_timelines_enabled": True,
-    "blue_business_profile_image_shape_enabled": True,
-    "creator_subscriptions_tweet_preview_api_enabled": True,
-    "freedom_of_speech_not_reach_fetch_enabled": True,
-    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
-    "graphql_timeline_v2_bookmark_timeline": True,
-    "hidden_profile_likes_enabled": True,
-    "highlights_tweets_tab_ui_enabled": True,
-    "interactive_text_enabled": True,
-    "longform_notetweets_consumption_enabled": True,
-    "longform_notetweets_inline_media_enabled": True,
-    "longform_notetweets_rich_text_read_enabled": True,
-    "longform_notetweets_richtext_consumption_enabled": True,
-    "profile_foundations_tweet_stats_enabled": True,
-    "profile_foundations_tweet_stats_tweet_frequency": True,
-    "responsive_web_birdwatch_note_limit_enabled": True,
-    "responsive_web_edit_tweet_api_enabled": True,
-    "responsive_web_enhance_cards_enabled": False,
-    "responsive_web_graphql_exclude_directive_enabled": True,
-    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-    "responsive_web_graphql_timeline_navigation_enabled": True,
-    "responsive_web_media_download_video_enabled": False,
-    "responsive_web_text_conversations_enabled": False,
-    "responsive_web_twitter_article_data_v2_enabled": True,
-    "responsive_web_twitter_article_tweet_consumption_enabled": False,
-    "responsive_web_twitter_blue_verified_badge_is_enabled": True,
-    "rweb_lists_timeline_redesign_enabled": True,
-    "spaces_2022_h2_clipping": True,
-    "spaces_2022_h2_spaces_communities": True,
-    "standardized_nudges_misinfo": True,
-    "subscriptions_verification_info_verified_since_enabled": True,
-    "tweet_awards_web_tipping_enabled": False,
-    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
-    "tweetypie_unmention_optimization_enabled": True,
-    "verified_phone_label_enabled": False,
-    "vibe_api_enabled": True,
-    "view_counts_everywhere_api_enabled": True,
-}
-
-# Default variables required by many GraphQL operations (matches trevorhobenshield)
-DEFAULT_VARIABLES = {
-    "count": 1000,
-    "withSafetyModeUserFields": True,
-    "includePromotedContent": True,
-    "withQuickPromoteEligibilityTweetFields": True,
-    "withVoice": True,
-    "withV2Timeline": True,
-    "withDownvotePerspective": False,
-    "withBirdwatchNotes": True,
-    "withCommunity": True,
-    "withSuperFollowsUserFields": True,
-    "withMessages": True,
-}
-
-# Standard feature flags for timeline/profile queries (matches X web app)
-TIMELINE_FEATURES = {
-    "rweb_video_screen_enabled": False,
-    "rweb_cashtags_enabled": True,
-    "profile_label_improvements_pcf_label_in_post_enabled": True,
-    "responsive_web_profile_redirect_enabled": False,
-    "rweb_tipjar_consumption_enabled": False,
-    "verified_phone_label_enabled": False,
-    "creator_subscriptions_tweet_preview_api_enabled": True,
-    "responsive_web_graphql_timeline_navigation_enabled": True,
-    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-    "premium_content_api_read_enabled": False,
-    "communities_web_enable_tweet_community_results_fetch": True,
-    "c9s_tweet_anatomy_moderator_badge_enabled": True,
-    "responsive_web_edit_tweet_api_enabled": True,
-    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
-    "view_counts_everywhere_api_enabled": True,
-    "longform_notetweets_consumption_enabled": True,
-    "responsive_web_twitter_article_tweet_consumption_enabled": True,
-    "responsive_web_enhance_cards_enabled": False,
-    "freedom_of_speech_not_reach_fetch_enabled": True,
-    "standardized_nudges_misinfo": True,
-    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
-    "longform_notetweets_rich_text_read_enabled": True,
-    "responsive_web_grok_image_annotation_enabled": True,
-}
-TIMELINE_FIELD_TOGGLES = ["withPayments", "withAuxiliaryUserLabels"]
-
-# Write operation IDs — these rotate every few months.
-# Update via env vars: SPECTRE_OP_CREATE_TWEET, etc.
-# Source: fa0311/TwitterInternalAPIDocument (auto-generated from X's JS)
-OPERATIONS = {
-    "CreateTweet": "DQIp0b4mKIciCAZ3bfrwAA",
-    "CreateRetweet": "mbRO74GrOvSfRcJnlMapnQ",
-    "DeleteRetweet": "ZyZigVsNiFO6v1dEks1eWg",
-    "FavoriteTweet": "lI07N6Otwv1PhnEgXILM7A",
-    "UnfavoriteTweet": "ZYKSe-w7KEslx3JhSIk5LA",
-    "CreateBookmark": "aoDbu3RHznuiSkQ9aNM67Q",
-    "DeleteBookmark": "Wlmlj2-xzyS1GN3a6cj-mQ",
-    # Follow/Unfollow use REST v1.1 (friendships/create.json, friendships/destroy.json)
-    "DeleteTweet": "nxpZCY2K-I6QoFHAHeojFQ",
-    "CreateList": "hQAsnViq2BrMLbPuQ9umDA",
-    "UpdateList": "4dCEFWtxEbhnSLcJdJ6PNg",
-    "ListAddMember": "P8tyfv2_0HzofrB5f6_ugw",
-    "ListRemoveMember": "DBZowzFN492FFkBPBptCwg",
-    "JoinCommunity": "8lR4bNpbNZKbmK6MwZtU-Q",
-    "LeaveCommunity": "0YUrwfndvmPYbgmQxPFySQ",
-    "useSendMessageMutation": "MaxK2PKX1F9Z-9SwqwavTw",
-    # Scheduled tweets
-    "CreateScheduledTweet": "LCVzRQGxOaGnOnYH01NQXg",
-    "FetchScheduledTweets": "H2elmT2R9DLhWoo0DZFNkA",
-    "DeleteScheduledTweet": "CTOVqej0JBXAZSwkp1US0g",
-    # Draft tweets
-    "CreateDraftTweet": "cH9HZWz_EW9gnswvA4ZRiQ",
-    "FetchDraftTweets": "L9RqKWmAWxK6vGtR3Qdsxw",
-    "DeleteDraftTweet": "bkh9G3FGgTldS9iTKWWYYw",
-    # Bookmark folders
-    "BookmarkFoldersSlice": "i78YDd0Tza-dV4SYs58kRg",
-    "createBookmarkFolder": "6Xxqpq8TM_CREYiuof_h5w",
-    "DeleteBookmarkFolder": "2UTTsO-6zs93XqlEUZPsSg",
-    "EditBookmarkFolder": "a6kPp1cS1Dgbsjhapz1PNw",
-    "bookmarkTweetToFolder": "4KHZvvNbHNf07bsgnL9gWA",
-    "RemoveTweetFromBookmarkFolder": "2Qbj9XZvtUvyJB4gFwWfaA",
-    # Lists
-    "DeleteList": "UnN9Th1BDbeLjpgjGSpL3Q",
-    # Topics
-    "TopicFollow": "ElqSLWFmsPL4NlZI5e1Grg",
-    "TopicUnfollow": "srwjU6JM_ZKTj_QMfUGNcw",
-    # Community Notes
-    "BirdwatchCreateNote": "c9kb2zackjmDEFG8hmii5Q",
-    "BirdwatchFetchNotes": "ZGMhf1M7kPKMOhEk1nz0Yw",
-    "BirdwatchCreateRating": "gbshFt1Vmddrlio4vHWhhQ",
-    # Account Settings
-    "PinTweet": "VIHsNu89pK-kW35JpHq7Xw",
-    "UnpinTweet": "BhKei844ypCyLYCg0nwigw",
-    "CreateHighlight": "7jEc7ECTTDcNaqsMhjTxXg",
-    "DeleteHighlight": "ea-VVDSLIEYNY2_2aPg3Uw",
-    "UserHighlightsTweets": "W3_o6ulKbViS-IIJJYmzmQ",
-    "BlueVerifiedFollowers": "OBBd6Dw-4qEYbsu3hGkyxg",
-    "MutedAccounts": "RiyYWu0qlF6QyfUkDOCoxA",
-    "BlockedAccountsAll": "dXAVNBZjLy9JoZd6JCjc-A",
-    "DmAllSearchSlice": "iRnhDpR6lACfABoAfB15Fw",
-    "DmGroupSearchSlice": "LxrvmqF3Lokl_BYZ1c83LA",
-    "DmMutedTimeline": "QyDqQSyzNScMdXRc0bl-Lw",
-    "DmPeopleSearchSlice": "c1MnRRmI-_Bggpntlq9-hQ",
-    "Likes": "enfPHxWV3DDAG1XBw3obTg",
-    "BookmarkFolderTimeline": "ANUliFjDZdjSWb_3FNe9sQ",
-    "BookmarkSearchTimeline": "vqy7GkKMR5TYk8_ysuhmfA",
-    "BookmarksAllDelete": "skiACZKC1GDYli-M8RzEPQ",
-    "dmBlockUser": "IYw9u1KEhrS-t-BXsau4Uw",
-    "dmUnblockUser": "Krbs6Nak_o7liWQwfV1jOQ",
-    # Home Timeline
-    "HomeTimeline": "MP5Mn45hEc4i_q_UwIHBkw",
-    "HomeLatestTimeline": "n2m8OTpLdsM3Zhv33ljKoA",
-    # Edit operations
-    "EditDraftTweet": "JIeXE-I6BZXHfxsgOkyHYQ",
-    "EditScheduledTweet": "_mHkQ5LHpRRjSXKOcG6eZw",
-    # Tweet info
-    "Favoriters": "6SsQvi19ZR-txuiu7Uo2OA",
-    "TweetEditHistory": "pMXJaYs8H1xEAJ4NOhxIoQ",
-    "SimilarPosts": "V44P4GxNvHeAgh5zTFLljw",
-    # Social
-    "RemoveFollower": "QpNfg0kpPRfjROQ_9eOLXA",
-    "PinReply": "GA2_1uKP9b_GyR4MVAQXAw",
-    "UnpinReply": "iRe6ig5OV1EzOtldNIuGDQ",
-    "FollowersYouKnow": "Zo44022i9Z7XcX7T-Ez7Og",
-    # Lists (extended)
-    "ListSubscribe": "HclInJtqqdh2wU7Q5-cevA",
-    "ListUnsubscribe": "GcrwbuN8ZdD84wYDaBlSSg",
-    "ListMemberships": "jQSaHZiOSU9LcOTyid6Xlw",
-    "ListOwnerships": "_4Kw0FQkvL1gb8NgcO_7Rw",
-    "ListSubscribers": "T_fzE_mzqtsd-rhNvL5YaQ",
-    # Topics (extended)
-    "TopicByRestId": "4OUZZOonV2h60I0wdlQb_w",
-    # Notifications
-    "NotificationsTimeline": "N3mgBYxj7qj5GUZmyYuKFg",
-    # User (extended)
-    "UserTweetsAndReplies": "plVqzvVGaDxbFEPoOe_i-A",
-}
-
-# Allow env overrides for operation IDs
-for op_name in OPERATIONS:
-    env_key = f"SPECTRE_OP_{op_name.upper()}"
-    if env_val := os.environ.get(env_key):
-        OPERATIONS[op_name] = env_val
+from spectre.errors import XError, from_x_error
+from spectre.parse import (
+    dm_conversations,
+    dm_messages,
+    iso_time,
+    notifications as parse_notifications,
+    sid,
+    timeline,
+    tweet_dict,
+    user_dict,
+)
+from spectre.xclient import BEARER, REST, XClient, _cookies
 
 
-def _get_operation(name: str) -> str:
-    op_id = OPERATIONS.get(name)
-    if not op_id:
-        raise ValueError(f"Unknown operation: {name}")
-    return f"{op_id}/{name}"
+def safe(fn):
+    """Turn XError / unexpected exceptions into a tool-shaped error dict."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except XError as exc:
+            return exc.to_dict()
+        except Exception as exc:  # noqa: BLE001 - a tool must never crash the server
+            logger.exception(f"{fn.__name__} failed")
+            return {"error": f"{type(exc).__name__}: {exc}", "kind": "internal"}
+
+    return wrapper
 
 
-def _rate_limit_error(operation: str, retry_after: int | None = None) -> dict:
-    """Build a clear rate limit error message for agents."""
-    msg = {
-        "error": "rate_limited",
-        "operation": operation,
-        "message": f"X rate limit hit on {operation}.",
-    }
-    if retry_after:
-        msg["retry_after_seconds"] = retry_after
-        msg["instruction"] = f"Wait {retry_after} seconds, then retry. Or use list_accounts() to see available accounts and set_active_account() to switch to a different one."
-    else:
-        msg["instruction"] = "Use list_accounts() to see available accounts. Use set_active_account(username) to switch to a different account. Or wait a few minutes and retry."
-    return msg
+def _cursor_vars(cursor: Optional[str], count: int) -> dict:
+    if cursor:
+        return {"count": count, "cursor": cursor}
+    return {"count": count}
 
 
 class Writer:
-    """Authenticated write operations with account pool management.
+    """All authenticated X operations, on top of one shared XClient."""
 
-    Supports selecting a specific account for operations, or auto-selects
-    the first active account. Rate limits are caught and surfaced clearly.
-    """
-
-    def __init__(self, pool, proxy: Optional[str] = None, db_path: Optional[str] = None):
-        self.pool = pool
-        self.proxy = proxy
+    def __init__(self, client: XClient, db_path: Optional[str] = None):
+        self.x = client
         self.db_path = db_path
-        self._preferred_account: Optional[str] = None
-        self._auto_rotate: bool = True  # When False, only use preferred account
 
-    def set_preferred_account(self, username: Optional[str]) -> None:
-        """Set a preferred account for write operations. None = auto-select."""
-        self._preferred_account = username
+    # ══════════════════════════════════════════════════════════
+    #  Identity
+    # ══════════════════════════════════════════════════════════
 
-    def set_auto_rotate(self, enabled: bool) -> None:
-        """Enable/disable automatic account rotation on rate limits.
-
-        When disabled and a preferred account is set, only that account is used.
-        Rate limits will be returned as errors instead of silently rotating.
-        """
-        self._auto_rotate = enabled
-
-    async def _get_session(self, preferred: Optional[str] = None) -> tuple[httpx.AsyncClient, dict]:
-        """Get an authenticated HTTP client from the pool.
-
-        Args:
-            preferred: Username to prefer. Falls back to self._preferred_account, then first active.
-        """
-        accounts = await self.pool.get_all()
-        if not accounts:
-            raise RuntimeError("No accounts in pool. Add one with: spectre add <username> \"auth_token=xxx; ct0=yyy\"")
-
-        target = preferred or self._preferred_account
-        acc = None
-
-        # Try preferred account first
-        if target:
-            for a in accounts:
-                if a.username == target and a.active and not a.error_msg:
-                    acc = a
-                    break
-            if not acc:
-                if not self._auto_rotate:
-                    raise RuntimeError(f"Account @{target} is not available and auto-rotate is disabled. Use list_accounts() to check status, or enable auto-rotate.")
-                available = [a.username for a in accounts if a.active and not a.error_msg]
-                if available:
-                    logger.warning(f"Preferred account @{target} not available, using @{available[0]}")
-                    acc = next(a for a in accounts if a.username == available[0])
-
-        # Fall back to first active (only if auto-rotate is on)
-        if not acc:
-            for a in accounts:
-                if a.active and not a.error_msg:
-                    acc = a
-                    break
-
-        if not acc:
-            error_accounts = [a for a in accounts if a.error_msg]
-            if error_accounts:
-                errors = "; ".join(f"@{a.username}: {a.error_msg}" for a in error_accounts)
-                raise RuntimeError(f"All accounts have errors: {errors}. Use set_active_account() to reset or add_account_cookies() to add fresh cookies.")
-            raise RuntimeError("No active accounts. Use add_account_cookies() to add one.")
-
-        cookies = acc.cookies
-        if isinstance(cookies, str):
-            cookies = json.loads(cookies)
-
-        headers = {
-            "authorization": f"Bearer {BEARER_TOKEN}",
-            "x-csrf-token": cookies.get("ct0", ""),
-            "content-type": "application/json",
-            "x-twitter-active-user": "yes",
-            "x-twitter-auth-type": "OAuth2Session",
-            "x-twitter-client-language": "en",
-            "user-agent": acc.user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "referer": "https://x.com/",
+    @safe
+    async def me(self) -> dict:
+        """Who the session actually is, per X (not per the local DB)."""
+        data = await self.x.graphql("Viewer", {})
+        viewer = (data.get("data") or {}).get("viewer") or {}
+        user = user_dict((viewer.get("user_results") or {}).get("result"))
+        if not user:
+            raise XError("Could not read the logged-in account.", kind="auth", hint="Re-add the account cookies.")
+        if not user.get("bio"):
+            # Viewer returns a trimmed user object; the profile query has the bio.
+            try:
+                full = await self.user(user["username"])
+                user = {**user, **{k: v for k, v in full.items() if v not in (None, "", 0, False) or user.get(k) in (None, "")}}
+            except XError:
+                pass
+        # The pool stores whatever handle was typed at `spectre add` time. If the
+        # account was renamed, that handle is stale and every profile lookup on it
+        # returns "not found" — surface the real one so the caller can fix it.
+        return {
+            "username": user["username"],
+            "id": user["id"],
+            "display_name": user["display_name"],
+            "bio": user["bio"],
+            "followers": user["followers"],
+            "following": user["following"],
+            "tweets": user["tweets"],
+            "likes": user["likes"],
+            "verified": user["verified"],
+            "blue_verified": user["blue_verified"],
+            "profile_image_url": user["profile_image_url"],
+            "banner_url": user["banner_url"],
+            "created_at": user["created_at"],
+            "protected": user["protected"],
+            "can_dm": viewer.get("can_dm"),
         }
 
-        cookie_jar = httpx.Cookies()
-        cookie_jar.set("auth_token", cookies.get("auth_token", ""), domain=".x.com")
-        cookie_jar.set("ct0", cookies.get("ct0", ""), domain=".x.com")
-        # Also set cookies for twitter.com and api.twitter.com (REST v1.1 endpoints)
-        cookie_jar.set("auth_token", cookies.get("auth_token", ""), domain=".twitter.com")
-        cookie_jar.set("ct0", cookies.get("ct0", ""), domain=".twitter.com")
-        cookie_jar.set("auth_token", cookies.get("auth_token", ""), domain="api.twitter.com")
-        cookie_jar.set("ct0", cookies.get("ct0", ""), domain="api.twitter.com")
+    @safe
+    async def account_settings(self) -> dict:
+        """Settings-shaped view of the authenticated account (GraphQL Viewer)."""
+        me = await self.me()
+        if "error" in me:
+            return me
+        pool_user = None
+        try:
+            accounts = await self.x.pool.get_all()
+            pool_user = next((a.username for a in accounts if a.active), None)
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            **me,
+            "pool_username": pool_user,
+            "pool_username_stale": bool(pool_user and pool_user.lower() != me["username"].lower()),
+            "note": "X removed the REST /account/settings.json endpoint; these are the fields Viewer exposes.",
+        }
 
-        proxy_url = self.proxy or acc.proxy
-        client = httpx.AsyncClient(
-            headers=headers,
-            cookies=cookie_jar,
-            proxy=proxy_url,
-            timeout=30,
+    @safe
+    async def user(self, username: str) -> dict:
+        data = await self.x.graphql("UserByScreenName", {"screen_name": username.lstrip("@"), "withSafetyModeUserFields": True})
+        user = user_dict((data.get("data") or {}).get("user", {}).get("result"))
+        if not user:
+            raise XError(f"User @{username} not found.", kind="not_found", code=50)
+        return user
+
+    @safe
+    async def user_by_id(self, user_id: str) -> dict:
+        data = await self.x.graphql("UserByRestId", {"userId": str(user_id), "withSafetyModeUserFields": True})
+        user = user_dict((data.get("data") or {}).get("user", {}).get("result"))
+        if not user:
+            raise XError(f"No user with id {user_id}", kind="not_found", code=50)
+        return user
+
+    @safe
+    async def users_by_ids(self, user_ids: list[str]) -> dict:
+        users, missing = [], []
+        for uid in user_ids:
+            result = await self.user_by_id(uid)
+            if isinstance(result, dict) and "error" in result:
+                missing.append(str(uid))
+            else:
+                users.append(result)
+        return {"users": users, "count": len(users), "missing": missing}
+
+    # ══════════════════════════════════════════════════════════
+    #  Tweets
+    # ══════════════════════════════════════════════════════════
+
+    @safe
+    async def tweet(self, tweet_id: str) -> dict:
+        data = await self.x.graphql(
+            "TweetResultByRestId",
+            {"tweetId": str(tweet_id), "includePromotedContent": False, "withVoice": False, "withCommunity": False},
         )
-        return client, {"username": acc.username}
+        result = (data.get("data") or {}).get("tweetResult", {}).get("result")
+        tweet = tweet_dict(result)
+        if not tweet:
+            # Deleted, protected, or age-restricted: TweetDetail sometimes still has it.
+            detail = await self.x.graphql(
+                "TweetDetail",
+                {"focalTweetId": str(tweet_id), "includePromotedContent": False, "withVoice": False, "withBirdwatchNotes": False},
+            )
+            tweets, _, _ = timeline(detail)
+            tweet = next((t for t in tweets if t["id"] == str(tweet_id)), None)
+        if not tweet:
+            raise XError(f"Tweet {tweet_id} not found (deleted, protected, or wrong id).", kind="not_found", code=144)
+        return tweet
 
-    async def _post(self, operation: str, variables: dict, features: dict | None = None, field_toggles: dict | None = None) -> dict:
-        """Make an authenticated POST to X's GraphQL API."""
-        op_path = _get_operation(operation)
-        url = f"{GQL_URL}/{op_path}"
-        path = f"/i/api/graphql/{op_path}"
+    @safe
+    async def tweets(self, tweet_ids: list[str]) -> dict:
+        data = await self.x.graphql(
+            "TweetResultsByRestIds",
+            {"tweetIds": [str(i) for i in tweet_ids], "includePromotedContent": False, "withVoice": False, "withCommunity": False},
+        )
+        results = (data.get("data") or {}).get("tweetResult") or []
+        tweets = [t for t in (tweet_dict(r.get("result")) for r in results) if t]
+        found = {t["id"] for t in tweets}
+        return {"tweets": tweets, "count": len(tweets), "missing": [i for i in map(str, tweet_ids) if i not in found]}
 
-        body: dict = {"variables": DEFAULT_VARIABLES | variables}
-        body["queryId"] = op_path.split("/")[0]  # Include queryId in body (twitter-cli pattern)
-        body["features"] = features or DEFAULT_FEATURES
-        if field_toggles is not None:
-            body["fieldToggles"] = field_toggles
+    @safe
+    async def quotes(self, tweet_id: str, limit: int = 20, cursor: Optional[str] = None) -> dict:
+        data = await self.x.graphql(
+            "SearchTimeline",
+            {
+                "rawQuery": f"quoted_tweet_id:{tweet_id}",
+                "count": limit,
+                "querySource": "typed_query",
+                "product": "Latest",
+                **_cursor_vars(cursor, limit),
+            },
+        )
+        tweets, users, next_cursor = timeline(data)
+        return {"tweets": tweets, "count": len(tweets), "next_cursor": next_cursor}
 
-        client, acc_info = await self._get_session()
-        try:
-            # Generate x-client-transaction-id
-            try:
-                from twscrape.queue_client import XClIdGenStore
-                gen = await XClIdGenStore.get(acc_info["username"])
-                txn_id = gen.calc("POST", path)
-                client.headers["x-client-transaction-id"] = txn_id
-            except Exception as e:
-                logger.warning(f"Could not generate x-client-transaction-id: {e}")
+    @safe
+    async def thread(self, tweet_id: str, limit: int = 50) -> dict:
+        data = await self.x.graphql(
+            "TweetDetail",
+            {"focalTweetId": str(tweet_id), "includePromotedContent": False, "withVoice": False, "withBirdwatchNotes": False},
+        )
+        tweets, _, _ = timeline(data)
+        focal = next((t for t in tweets if t["id"] == str(tweet_id)), None)
+        conversation_id = (focal or {}).get("conversation_id") or str(tweet_id)
+        # TweetDetail also injects promoted posts and "more to explore" modules;
+        # keep only members of this conversation, then order them.
+        tweets = [t for t in tweets if t.get("conversation_id") == conversation_id or t["id"] == str(tweet_id)]
+        tweets.sort(key=lambda t: (t.get("created_at") or "", t["id"]))
+        return {"tweets": tweets[:limit], "count": min(len(tweets), limit), "total": len(tweets)}
 
-            resp = await client.post(url, json=body)
+    @safe
+    async def favoriters(self, tweet_id: str, limit: int = 20, cursor: Optional[str] = None) -> dict:
+        data = await self.x.graphql(
+            "Favoriters", {"tweetId": str(tweet_id), "includePromotedContent": False, **_cursor_vars(cursor, limit)}
+        )
+        _, users, next_cursor = timeline(data)
+        result = {"users": users, "count": len(users), "next_cursor": next_cursor}
+        if not users:
+            result["note"] = "X did not return a likers list for this post (restricted on most accounts, not a Spectre failure)."
+        return result
 
-            # Handle rate limits
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("x-rate-limit-reset", 0))
-                logger.error(f"Rate limited ({operation}): retry after {retry_after}")
-                return _rate_limit_error(operation, retry_after)
+    @safe
+    async def similar_posts(self, tweet_id: str, limit: int = 20) -> dict:
+        data = await self.x.graphql("SimilarPosts", {"tweet_id": str(tweet_id), "count": limit})
+        tweets, _, _ = timeline(data)
+        result = {"tweets": tweets, "count": len(tweets)}
+        if not tweets:
+            # X gates this behind Premium and returns a paywall prompt instead.
+            if "premium" in json.dumps(data).lower():
+                result["note"] = "X requires Premium for similar posts on this account."
+        return result
 
-            try:
-                data = resp.json()
-            except Exception:
-                return {"error": f"HTTP {resp.status_code}", "detail": resp.text[:300], "account": acc_info["username"]}
+    @safe
+    async def edit_history(self, tweet_id: str) -> dict:
+        data = await self.x.graphql("TweetEditHistory", {"tweetId": str(tweet_id)})
+        result = (data.get("data") or {}).get("tweet_result_by_rest_id", {}).get("result") or {}
+        history = result.get("edit_history_timeline") or {}
+        ids: list[str] = []
+        initial = None
+        for entry in history.get("entries") or []:
+            tr = ((entry.get("content") or {}).get("tweet_results") or {}).get("result") or {}
+            if tr.get("rest_id"):
+                ids.append(str(tr["rest_id"]))
+        legacy_edit = ((result.get("legacy") or {}).get("edit_info") or {})
+        initial = sid(legacy_edit.get("initial_tweet_id"))
+        if not ids and initial:
+            ids = [initial] + [str(i) for i in legacy_edit.get("edit_ids") or []]
+        return {"tweet_id": str(tweet_id), "edits": ids, "count": len(ids)}
 
-            if resp.status_code != 200:
-                logger.error(f"Write failed ({operation}): {resp.status_code} {json.dumps(data)[:300]}")
-                return {"error": f"HTTP {resp.status_code}", "detail": data, "account": acc_info["username"]}
+    @safe
+    async def community_notes(self, tweet_id: str) -> dict:
+        data = await self.x.graphql("BirdwatchFetchNotes", {"tweet_id": str(tweet_id)})
+        result = (data.get("data") or {}).get("tweet_result_by_rest_id", {}).get("result") or {}
+        notes_raw = ((result.get("misleading_birdwatch_notes") or {}).get("notes")) or []
+        notes = []
+        for n in notes_raw:
+            notes.append(
+                {
+                    "note_id": sid(n.get("note_id") or n.get("rest_id")),
+                    "text": n.get("summary", {}).get("text") if isinstance(n.get("summary"), dict) else n.get("text"),
+                    "rating": (n.get("rating") or {}).get("rating"),
+                    "created_at": iso_time(n.get("created_at_ms") or n.get("created_at")),
+                }
+            )
+        return {"tweet_id": str(tweet_id), "notes": notes, "count": len(notes)}
 
-            # X sometimes returns errors alongside data (non-fatal DecodeException)
-            # Only treat as error if there's no data alongside it
-            if "errors" in data and "data" not in data:
-                errors = "; ".join(e.get("message", str(e)) for e in data["errors"])
-                logger.error(f"Write errors ({operation}): {errors}")
-                return {"error": errors, "account": acc_info["username"]}
-            if "errors" in data:
-                logger.warning(f"Write warnings ({operation}): {data['errors']}")
+    @safe
+    async def rate_community_note(self, note_id: str, rating: str) -> dict:
+        rating = rating.lower().replace("-", "_")
+        if rating not in ("helpful", "not_helpful", "somewhat_helpful"):
+            raise XError("rating must be one of: helpful, somewhat_helpful, not_helpful", kind="validation")
+        data = await self.x.graphql("BirdwatchCreateRating", {"note_id": note_id, "rating": rating})
+        return {"status": "rated", "note_id": note_id, "rating": rating, "result": data.get("data")}
 
-            return data
-        finally:
-            await client.aclose()
+    # ── composing ──
 
-    async def _get(self, operation: str, variables: dict, features: dict | None = None, field_toggles: list | None = None) -> dict:
-        """Make an authenticated GET to X's GraphQL API."""
-        op_path = _get_operation(operation)
-        url = f"{GQL_URL}/{op_path}"
-        path = f"/i/api/graphql/{op_path}"
-
-        params = {"variables": json.dumps(variables)}
-        if features:
-            params["features"] = json.dumps(features)
-        if field_toggles is not None:
-            params["fieldToggles"] = json.dumps(field_toggles)
-
-        client, acc_info = await self._get_session()
-        try:
-            # Generate x-client-transaction-id (same as _post)
-            try:
-                from twscrape.queue_client import XClIdGenStore
-                gen = await XClIdGenStore.get(acc_info["username"])
-                txn_id = gen.calc("GET", path)
-                client.headers["x-client-transaction-id"] = txn_id
-            except Exception as e:
-                logger.warning(f"Could not generate x-client-transaction-id: {e}")
-
-            resp = await client.get(url, params=params)
-
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("x-rate-limit-reset", 0))
-                return _rate_limit_error(operation, retry_after)
-
-            try:
-                data = resp.json()
-            except Exception:
-                return {"error": f"HTTP {resp.status_code}", "detail": resp.text[:300], "account": acc_info["username"]}
-
-            if resp.status_code != 200:
-                return {"error": f"HTTP {resp.status_code}", "detail": data, "account": acc_info["username"]}
-
-            if "errors" in data:
-                errors = "; ".join(e.get("message", str(e)) for e in data["errors"])
-                return {"error": errors, "account": acc_info["username"]}
-
-            return data
-        finally:
-            await client.aclose()
-
-    # ── Tweet Operations ──
-
-    async def post_tweet(self, text: str, reply_to: int | None = None, quote_tweet: int | None = None, media_ids: list[int] | None = None) -> dict:
-        """Post a new tweet, optionally as a reply or quote."""
+    @safe
+    async def post(
+        self,
+        text: str,
+        reply_to: Optional[str] = None,
+        quote_tweet: Optional[str] = None,
+        media_ids: Optional[list[str]] = None,
+    ) -> dict:
+        if reply_to and quote_tweet:
+            raise XError("A tweet can be a reply or a quote, not both.", kind="validation")
         media_entities = [{"media_id": str(mid), "tagged_users": []} for mid in (media_ids or [])]
-        variables = {
+        variables: dict[str, Any] = {
             "tweet_text": text,
             "dark_request": False,
             "media": {"media_entities": media_entities, "possibly_sensitive": False},
@@ -437,1771 +307,1080 @@ class Writer:
         if quote_tweet:
             variables["attachment_url"] = f"https://x.com/i/status/{quote_tweet}"
 
-        features = {
-            "premium_content_api_read_enabled": False,
-            "communities_web_enable_tweet_community_results_fetch": True,
-            "c9s_tweet_anatomy_moderator_badge_enabled": True,
-            "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
-            "responsive_web_grok_analyze_post_followups_enabled": True,
-            "responsive_web_jetfuel_frame": False,
-            "responsive_web_grok_share_attachment_enabled": True,
-            "responsive_web_edit_tweet_api_enabled": True,
-            "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
-            "view_counts_everywhere_api_enabled": True,
-            "longform_notetweets_consumption_enabled": True,
-            "responsive_web_twitter_article_tweet_consumption_enabled": True,
-            "tweet_awards_web_tipping_enabled": False,
-            "responsive_web_grok_show_grok_translated_post": False,
-            "responsive_web_grok_analysis_button_from_backend": True,
-            "creator_subscriptions_quote_tweet_preview_enabled": False,
-            "longform_notetweets_rich_text_read_enabled": True,
-            "longform_notetweets_inline_media_enabled": True,
-            "profile_label_improvements_pcf_label_in_post_enabled": True,
-            "rweb_tipjar_consumption_enabled": True,
-            "verified_phone_label_enabled": True,
-            "articles_preview_enabled": True,
-            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-            "freedom_of_speech_not_reach_fetch_enabled": True,
-            "standardized_nudges_misinfo": True,
-            "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
-            "responsive_web_grok_image_annotation_enabled": True,
-            "responsive_web_graphql_timeline_navigation_enabled": True,
-            "responsive_web_enhance_cards_enabled": False,
-        }
+        data = await self.x.graphql("CreateTweet", variables)
+        result = ((data.get("data") or {}).get("create_tweet") or {}).get("tweet_results", {}).get("result") or {}
+        tweet_id = sid(result.get("rest_id"))
+        if not tweet_id:
+            # X happily returns 200 with a soft failure message.
+            reason = json.dumps(data.get("data") or data)[:300]
+            raise XError(f"X accepted the request but created no tweet: {reason}", kind="upstream")
+        return {"status": "posted", "tweet_id": tweet_id, "url": f"https://x.com/i/status/{tweet_id}", "text": text}
 
-        data = await self._post("CreateTweet", variables, features=features, field_toggles={})
+    @safe
+    async def delete_tweet(self, tweet_id: str) -> dict:
+        data = await self.x.graphql("DeleteTweet", {"tweet_id": str(tweet_id)})
+        if not (data.get("data") or {}).get("delete_tweet"):
+            raise XError(f"X did not accept the delete for {tweet_id}.", kind="upstream")
+        # X answers `{"tweet_results": {}}` whether or not the post existed, so the
+        # only honest confirmation is that the post can no longer be fetched.
+        import asyncio as _asyncio
 
-        tweet_id = (
-            data.get("data", {})
-            .get("create_tweet", {})
-            .get("tweet_results", {})
-            .get("result", {})
-            .get("rest_id")
-        )
-        if tweet_id:
-            return {"status": "posted", "tweet_id": tweet_id, "url": f"https://x.com/i/status/{tweet_id}"}
-        if "error" in data:
-            return data
-        return {"status": "unknown", "response": data}
-
-    async def delete_tweet(self, tweet_id: int) -> dict:
-        """Delete a tweet."""
-        variables = {"tweet_id": str(tweet_id)}
-        data = await self._post("DeleteTweet", variables)
-        return {"status": "deleted", "tweet_id": tweet_id}
-
-    # ── Engagement Operations ──
-
-    async def like(self, tweet_id: int) -> dict:
-        variables = {"tweet_id": str(tweet_id)}
-        await self._post("FavoriteTweet", variables)
-        return {"status": "liked", "tweet_id": tweet_id}
-
-    async def unlike(self, tweet_id: int) -> dict:
-        variables = {"tweet_id": str(tweet_id)}
-        await self._post("UnfavoriteTweet", variables)
-        return {"status": "unliked", "tweet_id": tweet_id}
-
-    async def retweet(self, tweet_id: int) -> dict:
-        variables = {"tweet_id": str(tweet_id), "dark_request": False}
-        await self._post("CreateRetweet", variables)
-        return {"status": "retweeted", "tweet_id": tweet_id}
-
-    async def unretweet(self, tweet_id: int) -> dict:
-        variables = {"source_tweet_id": str(tweet_id), "dark_request": False}
-        await self._post("DeleteRetweet", variables)
-        return {"status": "unretweeted", "tweet_id": tweet_id}
-
-    async def bookmark(self, tweet_id: int) -> dict:
-        variables = {"tweet_id": str(tweet_id)}
-        await self._post("CreateBookmark", variables)
-        return {"status": "bookmarked", "tweet_id": tweet_id}
-
-    async def unbookmark(self, tweet_id: int) -> dict:
-        variables = {"tweet_id": str(tweet_id)}
-        await self._post("DeleteBookmark", variables)
-        return {"status": "unbookmarked", "tweet_id": tweet_id}
-
-    # ── Social Operations ──
-
-    async def follow(self, user_id: int) -> dict:
-        """Follow a user via REST API."""
-        result = await self._rest_post("friendships/create.json", {"user_id": str(user_id)})
-        if "error" in result:
-            return result
-        return {"status": "followed", "user_id": user_id}
-
-    async def unfollow(self, user_id: int) -> dict:
-        """Unfollow a user via REST API."""
-        result = await self._rest_post("friendships/destroy.json", {"user_id": str(user_id)})
-        if "error" in result:
-            return result
-        return {"status": "unfollowed", "user_id": user_id}
-
-    # ── REST API Operations (mute/block use v1.1 REST, not GraphQL) ──
-
-    async def _rest_post(self, endpoint: str, data: dict) -> dict:
-        """Make an authenticated POST to X's REST API v1.1."""
-        url = f"https://api.twitter.com/1.1/{endpoint}"
-        client, acc_info = await self._get_session()
-        try:
-            # Pop content-type so httpx sets application/x-www-form-urlencoded
-            original_ct = client.headers.pop("content-type", None)
-            resp = await client.post(url, data=data)
-            if original_ct:
-                client.headers["content-type"] = original_ct
-            result = resp.json()
-
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("x-rate-limit-reset", 0))
-                return _rate_limit_error(endpoint, retry_after)
-
-            if resp.status_code != 200:
-                return {"error": f"HTTP {resp.status_code}", "detail": result, "account": acc_info["username"]}
-            return result
-        finally:
-            await client.aclose()
-
-    async def mute(self, user_id: int) -> dict:
-        result = await self._rest_post("mutes/users/create.json", {"user_id": str(user_id)})
-        if "error" in result:
-            return result
-        return {"status": "muted", "user_id": user_id}
-
-    async def unmute(self, user_id: int) -> dict:
-        result = await self._rest_post("mutes/users/destroy.json", {"user_id": str(user_id)})
-        if "error" in result:
-            return result
-        return {"status": "unmuted", "user_id": user_id}
-
-    async def block(self, user_id: int) -> dict:
-        result = await self._rest_post("blocks/create.json", {"user_id": str(user_id)})
-        if "error" in result:
-            return result
-        return {"status": "blocked", "user_id": user_id}
-
-    async def unblock(self, user_id: int) -> dict:
-        result = await self._rest_post("blocks/destroy.json", {"user_id": str(user_id)})
-        if "error" in result:
-            return result
-        return {"status": "unblocked", "user_id": user_id}
-
-    # ── List Management ──
-
-    async def create_list(self, name: str, description: str = "") -> dict:
-        variables = {"name": name, "description": description, "isPrivate": False}
-        data = await self._post("CreateList", variables)
-        list_id = data.get("data", {}).get("list", {}).get("id_str") or data.get("data", {}).get("create_list", {}).get("list", {}).get("id_str")
-        if list_id:
-            return {"status": "created", "list_id": list_id, "name": name}
-        if "error" in data:
-            return data
-        return {"status": "unknown", "response": data}
-
-    async def update_list(self, list_id: int, name: str, description: str = "") -> dict:
-        variables = {"listId": str(list_id), "name": name, "description": description}
-        await self._post("UpdateList", variables)
-        return {"status": "updated", "list_id": list_id}
-
-    async def add_list_member(self, list_id: int, user_id: int) -> dict:
-        variables = {"listId": str(list_id), "userId": str(user_id)}
-        await self._post("ListAddMember", variables)
-        return {"status": "added", "list_id": list_id, "user_id": user_id}
-
-    async def remove_list_member(self, list_id: int, user_id: int) -> dict:
-        variables = {"listId": str(list_id), "userId": str(user_id)}
-        await self._post("ListRemoveMember", variables)
-        return {"status": "removed", "list_id": list_id, "user_id": user_id}
-
-    async def subscribe_list(self, list_id: int) -> dict:
-        """Subscribe to a list."""
-        variables = {"listId": str(list_id)}
-        await self._post("ListSubscribe", variables)
-        return {"status": "subscribed", "list_id": list_id}
-
-    async def unsubscribe_list(self, list_id: int) -> dict:
-        """Unsubscribe from a list."""
-        variables = {"listId": str(list_id)}
-        await self._post("ListUnsubscribe", variables)
-        return {"status": "unsubscribed", "list_id": list_id}
-
-    async def get_list_memberships(self, user_id: int, limit: int = 20) -> dict:
-        """Get lists a user is a member of."""
-        variables = {"userId": str(user_id), "count": limit}
-        data = await self._get("ListMemberships", variables, features=TIMELINE_FEATURES, field_toggles=TIMELINE_FIELD_TOGGLES)
-        if "error" in data:
-            return data
-        # Try to parse lists from timeline; may still fail due to X API bug
-        lists = []
-        try:
-            instructions = self._find_instructions(data)
-            for instruction in instructions:
-                entries = instruction.get("entries", [])
-                if not entries:
-                    entries = instruction.get("moduleItems", [])
-                for entry in entries:
-                    content = entry.get("content", {})
-                    entry_type = content.get("entryType", "")
-                    if "Cursor" in entry_type:
-                        continue
-                    item_content = content.get("itemContent", {})
-                    list_result = item_content.get("list")
-                    if not list_result:
-                        list_result = item_content
-                    if list_result and list_result.get("id_str"):
-                        lists.append({
-                            "list_id": list_result.get("id_str"),
-                            "name": list_result.get("name"),
-                            "description": list_result.get("description", ""),
-                            "member_count": list_result.get("member_count", 0),
-                            "follower_count": list_result.get("follower_count", 0),
-                        })
-        except Exception as e:
-            logger.warning(f"Error parsing list memberships: {e}")
-        if not lists:
-            return {"error": "X API DecodeException — known server-side bug with ListMemberships. This is not a Spectre bug.", "lists": []}
-        return {"lists": lists, "count": len(lists)}
-
-    async def get_list_ownerships(self, user_id: int, limit: int = 20) -> dict:
-        """Get lists owned by a user."""
-        variables = {"userId": str(user_id), "count": limit, "isListMemberTargetUserId": str(user_id)}
-        data = await self._get("ListOwnerships", variables, features=TIMELINE_FEATURES, field_toggles=TIMELINE_FIELD_TOGGLES)
-        if "error" in data:
-            return data
-        lists = []
-        try:
-            instructions = self._find_instructions(data)
-            for instruction in instructions:
-                entries = instruction.get("entries", [])
-                if not entries:
-                    entries = instruction.get("moduleItems", [])
-                for entry in entries:
-                    content = entry.get("content", {})
-                    entry_type = content.get("entryType", "")
-                    if "Cursor" in entry_type:
-                        continue
-                    item_content = content.get("itemContent", {})
-                    list_result = item_content.get("list")
-                    if not list_result:
-                        list_result = item_content
-                    if list_result and list_result.get("id_str"):
-                        lists.append({
-                            "list_id": list_result.get("id_str"),
-                            "name": list_result.get("name"),
-                            "description": list_result.get("description", ""),
-                            "member_count": list_result.get("member_count", 0),
-                            "follower_count": list_result.get("follower_count", 0),
-                        })
-        except Exception as e:
-            logger.warning(f"Error parsing list ownerships: {e}")
-        if not lists:
-            return {"error": "X API DecodeException — known server-side bug with ListOwnerships. This is not a Spectre bug.", "lists": []}
-        return {"lists": lists, "count": len(lists)}
-
-    async def get_list_subscribers(self, list_id: int, limit: int = 20) -> dict:
-        """Get subscribers of a list."""
-        variables = {"listId": str(list_id), "count": limit}
-        data = await self._get("ListSubscribers", variables)
-        if "error" in data:
-            return data
-        return self._parse_any_user_list(data)
-
-    # ── Community Operations ──
-
-    async def join_community(self, community_id: int) -> dict:
-        variables = {"communityId": str(community_id)}
-        await self._post("JoinCommunity", variables)
-        return {"status": "joined", "community_id": community_id}
-
-    async def leave_community(self, community_id: int) -> dict:
-        variables = {"communityId": str(community_id)}
-        await self._post("LeaveCommunity", variables)
-        return {"status": "left", "community_id": community_id}
-
-    # ── DM Operations ──
-
-    async def send_dm(self, user_id: int, text: str) -> dict:
-        """Send a direct message to a user.
-
-        Creates a new DM conversation or adds to an existing one.
-        Note: The recipient must allow DMs from you (either they follow you,
-        or they have "Allow message requests from everyone" enabled).
-        """
-        import uuid as _uuid
-        variables = {
-            "message": {
-                "card": None,
-                "media": None,
-                "text": {"text": text},
-                "tweet": None,
-            },
-            "requestId": str(_uuid.uuid4()),
-            "target": {
-                "participant_ids": [str(user_id)]
-            },
-        }
-        data = await self._post("useSendMessageMutation", variables)
-        if "error" in data:
-            return data
-        result = data.get("data", {}).get("create_dm", {})
-        typename = result.get("__typename", "")
-        if typename == "CreateDmSuccess":
-            return {
-                "status": "sent",
-                "user_id": user_id,
-                "text": text,
-                "conversation_id": result.get("conversation_id"),
-                "dm_id": result.get("dm_id"),
-            }
-        failure = result.get("dm_validation_failure_type", "Unknown error")
-        return {"error": f"DM send failed: {failure}", "user_id": user_id}
-
-    async def get_dm_inbox(self, limit: int = 20) -> dict:
-        """Get DM inbox — recent conversations and messages.
-
-        Returns the most recent DM conversations with message previews.
-        Note: Message requests (from non-followed users) appear in the
-        'untrusted' inbox timeline.
-        """
-        client, acc_info = await self._get_session()
-        try:
-            resp = await client.get("https://x.com/i/api/1.1/dm/inbox_initial_state.json")
-            if resp.status_code != 200:
-                return {"error": f"HTTP {resp.status_code}", "detail": resp.text[:300]}
-            data = resp.json()
-            inbox = data.get("inbox_initial_state", {})
-            entries = inbox.get("entries", [])
-            users = inbox.get("users", {})
-            conversations = inbox.get("conversations", {})
-
-            messages = []
-            for entry in entries[:limit]:
-                msg = entry.get("message", {})
-                msg_data = msg.get("message_data", {})
-                sender_id = msg_data.get("sender_id", "")
-                sender = users.get(sender_id, {})
-                messages.append({
-                    "message_id": msg.get("id"),
-                    "conversation_id": msg.get("conversation_id"),
-                    "text": msg_data.get("text", ""),
-                    "sender_id": sender_id,
-                    "sender_username": sender.get("screen_name", ""),
-                    "recipient_id": msg_data.get("recipient_id"),
-                    "timestamp": msg_data.get("time"),
-                })
-
-            return {
-                "messages": messages,
-                "count": len(messages),
-                "conversation_count": len(conversations),
-            }
-        finally:
-            await client.aclose()
-
-    async def get_dm_conversation(self, conversation_id: str, limit: int = 50) -> dict:
-        """Get messages in a DM conversation.
-
-        Args:
-            conversation_id: The conversation ID (e.g. '17874544-2038267693875294208').
-                             Get IDs from get_dm_inbox() results.
-            limit: Max messages to return.
-        """
-        client, acc_info = await self._get_session()
-        try:
-            resp = await client.get(
-                f"https://x.com/i/api/1.1/dm/conversation/{conversation_id}.json",
-                params={"context": "FETCH_DM_CONVERSATION_HISTORY", "include_conversation_info": "true"},
+        # Check with the direct lookup only: TweetDetail keeps serving the
+        # conversation around a deleted post, which makes a deleted tweet look
+        # alive for a few seconds.
+        still_there = True
+        for delay in (0, 0.6, 1.5):
+            if delay:
+                await _asyncio.sleep(delay)
+            try:
+                data = await self.x.graphql(
+                    "TweetResultByRestId",
+                    {"tweetId": str(tweet_id), "includePromotedContent": False, "withVoice": False, "withCommunity": False},
+                )
+                result = (data.get("data") or {}).get("tweetResult", {}).get("result")
+                still_there = tweet_dict(result) is not None
+            except XError:
+                still_there = False
+            if not still_there:
+                break
+        if still_there:
+            raise XError(
+                f"X accepted the delete but {tweet_id} is still readable.",
+                kind="upstream",
+                hint="You can only delete your own posts.",
             )
-            if resp.status_code != 200:
-                return {"error": f"HTTP {resp.status_code}", "detail": resp.text[:300]}
-            data = resp.json()
-            timeline = data.get("conversation_timeline", {})
-            entries = timeline.get("entries", [])
-            users = timeline.get("users", {})
+        return {"status": "deleted", "tweet_id": str(tweet_id), "verified": True}
 
-            messages = []
-            for entry in entries[:limit]:
-                msg = entry.get("message", {})
-                msg_data = msg.get("message_data", {})
-                sender_id = msg_data.get("sender_id", "")
-                sender = users.get(sender_id, {})
-                messages.append({
-                    "message_id": msg.get("id"),
-                    "text": msg_data.get("text", ""),
-                    "sender_id": sender_id,
-                    "sender_username": sender.get("screen_name", ""),
-                    "recipient_id": msg_data.get("recipient_id"),
-                    "timestamp": msg_data.get("time"),
-                })
+    # ── engagement ──
 
-            return {
-                "conversation_id": conversation_id,
-                "messages": messages,
-                "count": len(messages),
-            }
-        finally:
-            await client.aclose()
+    async def _mutate(self, op: str, variables: dict, expect: str, action: str, extra: dict | None = None) -> dict:
+        data = await self.x.graphql(op, variables)
+        payload = (data.get("data") or {}).get(expect)
+        if payload is None:
+            raise XError(
+                f"X did not confirm the {action} action.",
+                kind="upstream",
+                hint=f"Raw response: {json.dumps(data)[:200]}",
+            )
+        return {"status": action, **(extra or {})}
 
-    # ── Scheduled Tweets ──
+    @safe
+    async def like(self, tweet_id: str) -> dict:
+        return await self._mutate("FavoriteTweet", {"tweet_id": str(tweet_id)}, "favorite_tweet", "liked", {"tweet_id": str(tweet_id)})
 
-    async def schedule_tweet(self, text: str, execute_at: str, reply_to: int | None = None) -> dict:
-        """Schedule a tweet for future posting.
+    @safe
+    async def unlike(self, tweet_id: str) -> dict:
+        return await self._mutate("UnfavoriteTweet", {"tweet_id": str(tweet_id)}, "unfavorite_tweet", "unliked", {"tweet_id": str(tweet_id)})
 
-        Args:
-            text: Tweet content.
-            execute_at: ISO 8601 datetime string (e.g. "2026-06-25T14:00:00Z").
-            reply_to: Optional tweet ID to reply to.
-        """
-        from datetime import datetime, timezone
-        # Convert ISO string to Unix timestamp (seconds)
-        try:
-            dt = datetime.fromisoformat(execute_at.replace("Z", "+00:00"))
-            execute_at_ts = int(dt.timestamp())
-        except ValueError:
-            return {"error": f"Invalid datetime format: {execute_at}. Use ISO 8601 (e.g. 2026-06-25T14:00:00Z)"}
-        variables = {
-            "post_tweet_request": {
-                "status": text,
-                "media_ids": [],
-            },
-            "execute_at": execute_at_ts,
+    @safe
+    async def retweet(self, tweet_id: str) -> dict:
+        return await self._mutate(
+            "CreateRetweet", {"tweet_id": str(tweet_id), "dark_request": False}, "create_retweet", "retweeted", {"tweet_id": str(tweet_id)}
+        )
+
+    @safe
+    async def unretweet(self, tweet_id: str) -> dict:
+        return await self._mutate(
+            "DeleteRetweet",
+            {"source_tweet_id": str(tweet_id), "dark_request": False},
+            "unretweet",
+            "unretweeted",
+            {"tweet_id": str(tweet_id)},
+        )
+
+    @safe
+    async def bookmark(self, tweet_id: str) -> dict:
+        data = await self.x.graphql("BookmarkAdd", {"tweetId": str(tweet_id)})
+        if not data.get("data"):
+            raise XError("X did not confirm the bookmark.", kind="upstream")
+        return {"status": "bookmarked", "tweet_id": str(tweet_id)}
+
+    @safe
+    async def unbookmark(self, tweet_id: str) -> dict:
+        data = await self.x.graphql("BookmarkDelete", {"tweetId": str(tweet_id)})
+        if not data.get("data"):
+            raise XError("X did not confirm the bookmark removal.", kind="upstream")
+        return {"status": "unbookmarked", "tweet_id": str(tweet_id)}
+
+    # ── social graph ──
+
+    @safe
+    async def follow(self, user_id: str) -> dict:
+        payload = await self.x.rest("POST", "friendships/create.json", data={"user_id": str(user_id)})
+        if not payload.get("id_str") and not payload.get("id"):
+            raise XError("X did not confirm the follow.", kind="upstream")
+        return {"status": "followed", "user_id": str(user_id), "username": payload.get("screen_name")}
+
+    @safe
+    async def unfollow(self, user_id: str) -> dict:
+        payload = await self.x.rest("POST", "friendships/destroy.json", data={"user_id": str(user_id)})
+        if not payload.get("id_str") and not payload.get("id"):
+            raise XError("X did not confirm the unfollow.", kind="upstream")
+        return {"status": "unfollowed", "user_id": str(user_id), "username": payload.get("screen_name")}
+
+    @safe
+    async def mute(self, user_id: str) -> dict:
+        payload = await self.x.rest("POST", "mutes/users/create.json", data={"user_id": str(user_id)})
+        if not payload.get("id_str") and not payload.get("id"):
+            raise XError("X did not confirm the mute.", kind="upstream")
+        return {"status": "muted", "user_id": str(user_id)}
+
+    @safe
+    async def unmute(self, user_id: str) -> dict:
+        payload = await self.x.rest("POST", "mutes/users/destroy.json", data={"user_id": str(user_id)})
+        if not payload.get("id_str") and not payload.get("id"):
+            raise XError("X did not confirm the unmute.", kind="upstream")
+        return {"status": "unmuted", "user_id": str(user_id)}
+
+    @safe
+    async def block(self, user_id: str) -> dict:
+        payload = await self.x.rest("POST", "blocks/create.json", data={"user_id": str(user_id)})
+        if not payload.get("id_str") and not payload.get("id"):
+            raise XError("X did not confirm the block.", kind="upstream")
+        return {"status": "blocked", "user_id": str(user_id)}
+
+    @safe
+    async def unblock(self, user_id: str) -> dict:
+        payload = await self.x.rest("POST", "blocks/destroy.json", data={"user_id": str(user_id)})
+        if not payload.get("id_str") and not payload.get("id"):
+            raise XError("X did not confirm the unblock.", kind="upstream")
+        return {"status": "unblocked", "user_id": str(user_id)}
+
+    @safe
+    async def remove_follower(self, user_id: str) -> dict:
+        data = await self.x.graphql("RemoveFollower", {"target_user_id": str(user_id)})
+        payload = (data.get("data") or {}).get("remove_follower") or {}
+        if payload.get("__typename") == "UnfollowInvalidRequestResult" or payload.get("success") is False:
+            raise XError(
+                f"X refused to remove follower {user_id}: {payload.get('parameter_error_reason') or payload}",
+                kind="validation",
+            )
+        return {"status": "removed_follower", "user_id": str(user_id)}
+
+    @safe
+    async def pin(self, tweet_id: str) -> dict:
+        data = await self.x.graphql("PinTweet", {"tweet_id": str(tweet_id)})
+        payload = (data.get("data") or {}).get("pin_tweet") or {}
+        if payload.get("message") and "not valid" in str(payload.get("message")).lower():
+            raise XError(payload["message"], kind="validation", hint="You can only pin your own, non-retweeted post.")
+        return {"status": "pinned", "tweet_id": str(tweet_id), "note": "Any previous pin was replaced."}
+
+    @safe
+    async def unpin(self, tweet_id: str) -> dict:
+        data = await self.x.graphql("UnpinTweet", {"tweet_id": str(tweet_id)})
+        payload = (data.get("data") or {}).get("unpin_tweet") or {}
+        return {"status": "unpinned", "tweet_id": str(tweet_id), "message": payload.get("message")}
+
+    @safe
+    async def pin_reply(self, tweet_id: str, conversation_id: str) -> dict:
+        data = await self.x.graphql("PinReply", {"tweetId": str(tweet_id), "conversationId": str(conversation_id)})
+        payload = (data.get("data") or {}).get("create_conversation_pinned_tweet") or {}
+        if payload.get("success") is False:
+            raise XError("X refused to pin that reply.", kind="validation")
+        return {"status": "pinned_reply", "tweet_id": str(tweet_id), "conversation_id": str(conversation_id)}
+
+    @safe
+    async def unpin_reply(self, tweet_id: str, conversation_id: str) -> dict:
+        data = await self.x.graphql("UnpinReply", {"tweetId": str(tweet_id), "conversationId": str(conversation_id)})
+        payload = (data.get("data") or {}).get("delete_conversation_pinned_tweet") or {}
+        if payload.get("success") is False:
+            raise XError("X refused to unpin that reply.", kind="validation")
+        return {"status": "unpinned_reply", "tweet_id": str(tweet_id), "conversation_id": str(conversation_id)}
+
+    @safe
+    async def dm_block(self, user_id: str) -> dict:
+        data = await self.x.graphql("dmBlockUser", {"target_user_id": str(user_id)})
+        payload = (data.get("data") or {}).get("dm_block_by_rest_id") or {}
+        if payload.get("__typename") == "DmBlockInvalidRequestResult":
+            raise XError(f"X refused the DM block: {payload.get('dm_block_invalid_request_reason')}", kind="validation")
+        return {"status": "dm_blocked", "user_id": str(user_id)}
+
+    @safe
+    async def dm_unblock(self, user_id: str) -> dict:
+        data = await self.x.graphql("dmUnblockUser", {"target_user_id": str(user_id)})
+        payload = (data.get("data") or {}).get("dm_unblock_by_rest_id") or {}
+        if payload.get("__typename") == "DmUnblockInvalidRequestResult":
+            raise XError(f"X refused the DM unblock: {payload.get('dm_unblock_invalid_request_reason')}", kind="validation")
+        return {"status": "dm_unblocked", "user_id": str(user_id)}
+
+    # ══════════════════════════════════════════════════════════
+    #  Lists
+    # ══════════════════════════════════════════════════════════
+
+    @safe
+    async def create_list(self, name: str, description: str = "", private: bool = False) -> dict:
+        data = await self.x.graphql(
+            "CreateList",
+            {"name": name, "description": description, "isPrivate": private, "withSuperFollowsUserFields": False},
+        )
+        result = (data.get("data") or {}).get("list") or {}
+        list_id = sid(result.get("id_str") or result.get("id"))
+        if not list_id:
+            raise XError("X did not return the new list id.", kind="upstream", hint=json.dumps(data.get("data") or {})[:200])
+        return {"status": "created", "list_id": list_id, "name": name, "private": private}
+
+    @safe
+    async def update_list(self, list_id: str, name: str, description: str = "", private: Optional[bool] = None) -> dict:
+        variables: dict[str, Any] = {
+            "listId": str(list_id),
+            "name": name,
+            "description": description,
+            "withSuperFollowsUserFields": False,
         }
-        if reply_to:
-            variables["post_tweet_request"]["reply"] = {"in_reply_to_tweet_id": str(reply_to)}
-        data = await self._post("CreateScheduledTweet", variables)
-        if "error" in data:
-            return data
-        return {"status": "scheduled", "execute_at": execute_at, "execute_at_timestamp": execute_at_ts}
+        if private is not None:
+            variables["isPrivate"] = private
+        data = await self.x.graphql("UpdateList", variables)
+        payload = (data.get("data") or {}).get("list")
+        if not payload:
+            raise XError(f"X did not confirm the update of list {list_id}.", kind="upstream")
+        return {"status": "updated", "list_id": str(list_id), "name": payload.get("name", name)}
 
-    async def get_scheduled_tweets(self) -> dict:
-        """Get all scheduled tweets."""
-        data = await self._post("FetchScheduledTweets", {"ascending": False})
-        if "error" in data:
-            return data
-        scheduled = []
-        try:
-            items = data.get("data", {}).get("viewer", {}).get("scheduled_tweet_list", [])
-            for item in items:
-                info = item.get("scheduling_info", {})
-                req = item.get("tweet_create_request", {})
-                scheduled.append({
-                    "scheduled_id": item.get("rest_id"),
-                    "text": req.get("status", ""),
-                    "execute_at": info.get("execute_at"),
-                    "state": info.get("state", ""),
-                    "media_ids": req.get("media_ids", []),
-                })
-        except Exception:
-            return data
-        return {"scheduled_tweets": scheduled, "count": len(scheduled)}
+    @safe
+    async def delete_list(self, list_id: str) -> dict:
+        data = await self.x.graphql("DeleteList", {"listId": str(list_id)})
+        if (data.get("data") or {}).get("list_delete") != "Done":
+            raise XError(f"X did not confirm deletion of list {list_id}.", kind="upstream")
+        return {"status": "deleted", "list_id": str(list_id)}
 
-    async def delete_scheduled_tweet(self, tweet_id: str) -> dict:
-        """Delete a scheduled tweet."""
-        data = await self._post("DeleteScheduledTweet", {"scheduled_tweet_id": tweet_id})
-        return {"status": "deleted", "scheduled_tweet_id": tweet_id}
-
-    # ── Draft Tweets ──
-
-    async def create_draft(self, text: str) -> dict:
-        """Save a tweet draft."""
-        variables = {"post_tweet_request": {"status": text, "media_ids": []}}
-        data = await self._post("CreateDraftTweet", variables)
-        if "error" in data:
-            return data
-        # Try multiple response paths
-        draft_id = (
-            data.get("data", {}).get("create_draft_tweet", {}).get("draft_tweet", {}).get("id")
-            or data.get("data", {}).get("create_draft_tweet", {}).get("rest_id")
+    @safe
+    async def add_list_member(self, list_id: str, user_id: str) -> dict:
+        data = await self.x.graphql(
+            "ListAddMember", {"listId": str(list_id), "userId": str(user_id), "withSuperFollowsUserFields": False}
         )
-        if not draft_id:
-            # Deep search for rest_id
-            def _find_rest_id(obj, depth=0):
-                if depth > 5: return None
-                if isinstance(obj, dict):
-                    if "rest_id" in obj and obj.get("__typename") in ("DraftTweet", "Tweet", None):
-                        return obj["rest_id"]
-                    for v in obj.values():
-                        r = _find_rest_id(v, depth + 1)
-                        if r: return r
-                elif isinstance(obj, list):
-                    for item in obj:
-                        r = _find_rest_id(item, depth + 1)
-                        if r: return r
-                return None
-            draft_id = _find_rest_id(data)
-        return {"status": "draft_created", "draft_id": draft_id}
+        payload = (data.get("data") or {}).get("list") or {}
+        if not payload:
+            raise XError(f"X did not confirm adding {user_id} to list {list_id}.", kind="upstream")
+        return {"status": "added", "list_id": str(list_id), "user_id": str(user_id)}
 
-    async def get_drafts(self) -> dict:
-        """Get all draft tweets."""
-        data = await self._post("FetchDraftTweets", {"ascending": False})
-        if "error" in data:
-            return data
-        drafts = []
-        try:
-            items = data.get("data", {}).get("viewer", {}).get("draft_list", {}).get("response_data", [])
-            for item in items:
-                req = item.get("tweet_create_request", {})
-                drafts.append({
-                    "draft_id": item.get("rest_id"),
-                    "text": req.get("status", ""),
-                    "media_ids": req.get("media_ids", []),
-                })
-        except Exception:
-            return data
-        return {"drafts": drafts, "count": len(drafts)}
+    @safe
+    async def remove_list_member(self, list_id: str, user_id: str) -> dict:
+        data = await self.x.graphql(
+            "ListRemoveMember", {"listId": str(list_id), "userId": str(user_id), "withSuperFollowsUserFields": False}
+        )
+        payload = (data.get("data") or {}).get("list") or {}
+        if not payload:
+            raise XError(f"X did not confirm removing {user_id} from list {list_id}.", kind="upstream")
+        return {"status": "removed", "list_id": str(list_id), "user_id": str(user_id)}
 
-    async def delete_draft(self, tweet_id: str) -> dict:
-        """Delete a draft tweet."""
-        data = await self._post("DeleteDraftTweet", {"draft_tweet_id": tweet_id})
-        return {"status": "deleted", "draft_id": tweet_id}
+    @safe
+    async def subscribe_list(self, list_id: str) -> dict:
+        data = await self.x.graphql("ListSubscribe", {"listId": str(list_id)})
+        payload = (data.get("data") or {}).get("list_subscribe_v3") or (data.get("data") or {}).get("list_subscribe")
+        if payload is None:
+            raise XError(f"X did not confirm subscribing to list {list_id}.", kind="upstream")
+        return {"status": "subscribed", "list_id": str(list_id)}
 
-    async def edit_draft(self, draft_id: str, text: str) -> dict:
-        """Edit an existing draft tweet."""
-        variables = {"draft_tweet_id": draft_id, "post_tweet_request": {"status": text, "media_ids": []}}
-        data = await self._post("EditDraftTweet", variables)
-        if "error" in data:
-            return data
-        return {"status": "edited", "draft_id": draft_id}
+    @safe
+    async def unsubscribe_list(self, list_id: str) -> dict:
+        data = await self.x.graphql("ListUnsubscribe", {"listId": str(list_id)})
+        payload = (data.get("data") or {}).get("list") or (data.get("data") or {}).get("list_unsubscribe")
+        if payload is None:
+            raise XError(f"X did not confirm unsubscribing from list {list_id}.", kind="upstream")
+        return {"status": "unsubscribed", "list_id": str(list_id)}
 
-    async def edit_scheduled_tweet(self, scheduled_id: str, text: str, execute_at: str) -> dict:
-        """Edit an existing scheduled tweet."""
-        from datetime import datetime
-        dt = datetime.fromisoformat(execute_at.replace("Z", "+00:00"))
-        execute_at_ts = int(dt.timestamp())
-        variables = {"scheduled_tweet_id": scheduled_id, "post_tweet_request": {"status": text, "media_ids": []}, "execute_at": execute_at_ts}
-        data = await self._post("EditScheduledTweet", variables)
-        if "error" in data:
-            return data
-        return {"status": "edited", "scheduled_id": scheduled_id}
+    @safe
+    async def list_info(self, list_id: str) -> dict:
+        data = await self.x.graphql("ListByRestId", {"listId": str(list_id)})
+        info = (data.get("data") or {}).get("list") or {}
+        if not info:
+            raise XError(f"List {list_id} not found.", kind="not_found")
+        return {
+            "list_id": sid(info.get("id_str") or info.get("id") or list_id),
+            "name": info.get("name"),
+            "description": info.get("description"),
+            "member_count": info.get("member_count"),
+            "subscriber_count": info.get("subscriber_count"),
+            "private": info.get("mode") == "private" or bool(info.get("is_private")),
+            "created_at": iso_time(info.get("created_at")),
+            "owner": user_dict(((info.get("user_results") or {}).get("result"))),
+        }
 
-    # ── Bookmark Folders ──
+    @safe
+    async def list_memberships(self, user_id: str, limit: int = 20, cursor: Optional[str] = None) -> dict:
+        data = await self.x.graphql("ListMemberships", {"userId": str(user_id), **_cursor_vars(cursor, limit)})
+        lists, next_cursor = _parse_list_timeline(data)
+        result = {"lists": lists, "count": len(lists), "next_cursor": next_cursor}
+        if not lists:
+            result["note"] = "X returned no lists for this user; its memberships timeline is unreliable outside the web client."
+        return result
 
-    async def get_bookmark_folders(self) -> dict:
-        """Get all bookmark folders."""
-        data = await self._post("BookmarkFoldersSlice", {})
-        if "error" in data:
-            return data
-        return self._parse_bookmark_folders(data)
+    @safe
+    async def list_ownerships(self, user_id: str, limit: int = 20, cursor: Optional[str] = None) -> dict:
+        data = await self.x.graphql(
+            "ListOwnerships",
+            {"userId": str(user_id), "isListMemberTargetUserId": str(user_id), **_cursor_vars(cursor, limit)},
+        )
+        lists, next_cursor = _parse_list_timeline(data)
+        return {"lists": lists, "count": len(lists), "next_cursor": next_cursor}
 
+    @safe
+    async def list_subscribers(self, list_id: str, limit: int = 20, cursor: Optional[str] = None) -> dict:
+        data = await self.x.graphql("ListSubscribers", {"listId": str(list_id), **_cursor_vars(cursor, limit)})
+        _, users, next_cursor = timeline(data)
+        return {"users": users, "count": len(users), "next_cursor": next_cursor}
+
+    # ══════════════════════════════════════════════════════════
+    #  Communities & topics
+    # ══════════════════════════════════════════════════════════
+
+    @safe
+    async def community_info(self, community_id: str) -> dict:
+        data = await self.x.graphql("CommunityByRestId", {"communityId": str(community_id)})
+        result = ((data.get("data") or {}).get("communityResults") or {}).get("result") or {}
+        if result.get("__typename") != "Community":
+            raise XError(f"Community {community_id} is unavailable.", kind="not_found")
+        return {
+            "community_id": str(community_id),
+            "name": result.get("name"),
+            "description": result.get("description"),
+            "member_count": result.get("member_count"),
+            "created_at": iso_time(result.get("created_at")),
+            "is_member": (result.get("members_facepile_results") is not None),
+            "join_policy": result.get("join_policy"),
+            "admin": user_dict(((result.get("admin_results") or {}).get("result"))),
+        }
+
+    @safe
+    async def join_community(self, community_id: str) -> dict:
+        data = await self.x.graphql("JoinCommunity", {"communityId": str(community_id)})
+        payload = (data.get("data") or {}).get("community_join")
+        if payload is None:
+            raise XError(f"X did not confirm joining community {community_id}.", kind="upstream")
+        return {"status": "joined", "community_id": str(community_id)}
+
+    @safe
+    async def leave_community(self, community_id: str) -> dict:
+        data = await self.x.graphql("LeaveCommunity", {"communityId": str(community_id)})
+        payload = (data.get("data") or {}).get("community_leave")
+        if payload is None:
+            raise XError(f"X did not confirm leaving community {community_id}.", kind="upstream")
+        return {"status": "left", "community_id": str(community_id)}
+
+    @safe
+    async def topic_info(self, topic_id: str) -> dict:
+        data = await self.x.graphql("TopicByRestId", {"topicId": str(topic_id)})
+        topic = (data.get("data") or {}).get("topic") or {}
+        if not topic or not topic.get("name"):
+            raise XError(f"Topic {topic_id} not found.", kind="not_found", hint="X only resolves topic ids it handed out itself (trends/topic pages).")
+        return {
+            "topic_id": str(topic_id),
+            "name": topic.get("name"),
+            "following": topic.get("following"),
+            "not_interested": topic.get("not_interested"),
+        }
+
+    @safe
+    async def follow_topic(self, topic_id: str) -> dict:
+        data = await self.x.graphql("TopicFollow", {"topicId": str(topic_id)})
+        topic = (data.get("data") or {}).get("topic") or {}
+        if not topic.get("name"):
+            raise XError(f"Topic {topic_id} not found.", kind="not_found")
+        if topic.get("following") is False:
+            raise XError("X did not follow that topic.", kind="upstream")
+        return {"status": "followed", "topic_id": str(topic_id), "name": topic.get("name")}
+
+    @safe
+    async def unfollow_topic(self, topic_id: str) -> dict:
+        data = await self.x.graphql("TopicUnfollow", {"topicId": str(topic_id)})
+        topic = (data.get("data") or {}).get("topic") or {}
+        if not topic.get("name"):
+            raise XError(f"Topic {topic_id} not found.", kind="not_found")
+        return {"status": "unfollowed", "topic_id": str(topic_id), "name": topic.get("name")}
+
+    # ══════════════════════════════════════════════════════════
+    #  Direct messages
+    # ══════════════════════════════════════════════════════════
+
+    @safe
+    async def send_dm(self, user_id: str, text: str) -> dict:
+        variables = {
+            "message": {"card": None, "media": None, "text": {"text": text}, "tweet": None},
+            "requestId": str(uuid.uuid4()),
+            "target": {"participant_ids": [str(user_id)]},
+        }
+        data = await self.x.graphql("useSendMessageMutation", variables)
+        result = (data.get("data") or {}).get("create_dm") or {}
+        if result.get("__typename") != "CreateDmSuccess":
+            reason = result.get("dm_validation_failure_type") or result.get("__typename") or "unknown"
+            raise XError(f"DM not sent: {reason}", kind="validation", hint="The recipient must allow DMs from you.")
+        return {
+            "status": "sent",
+            "user_id": str(user_id),
+            "text": text,
+            "conversation_id": sid(result.get("conversation_id")),
+            "dm_id": sid(result.get("dm_id")),
+        }
+
+    @safe
+    async def dm_inbox(self, limit: int = 20) -> dict:
+        payload = await self.x.rest("GET", "dm/inbox_initial_state.json")
+        messages = dm_messages(payload)[:limit]
+        conversations = dm_conversations(payload)
+        return {
+            "messages": messages,
+            "count": len(messages),
+            "conversations": conversations,
+            "conversation_count": len(conversations),
+        }
+
+    @safe
+    async def dm_conversation(self, conversation_id: str, limit: int = 50) -> dict:
+        payload = await self.x.rest(
+            "GET",
+            f"dm/conversation/{conversation_id}.json",
+            params={"context": "FETCH_DM_CONVERSATION_HISTORY", "include_conversation_info": "true"},
+        )
+        messages = dm_messages(payload)
+        messages.sort(key=lambda m: (m.get("timestamp") or "", m.get("message_id") or ""))
+        participants = dm_conversations(payload)
+        return {
+            "conversation_id": conversation_id,
+            "messages": messages[-limit:],
+            "count": min(len(messages), limit),
+            "total": len(messages),
+            "participants": participants[0]["participants"] if participants else [],
+        }
+
+    @safe
+    async def dm_search(self, query: str, limit: int = 20, kind: str = "all") -> dict:
+        op = {"all": "DmAllSearchSlice", "groups": "DmGroupSearchSlice", "people": "DmPeopleSearchSlice"}.get(kind)
+        if not op:
+            raise XError("kind must be one of: all, groups, people", kind="validation")
+        variables = {
+            "query": query,
+            "count": limit,
+            "withAttachments": False,
+            "withConversationQueryHighlights": False,
+            "withMessageQueryHighlights": False,
+        }
+        data = await self.x.graphql(op, variables)
+        tweets, users, cursor = timeline(data)
+        messages = _find_dm_messages(data)
+        if kind == "people":
+            # People search returns a user slice, not a timeline.
+            users = users or _find_users(data)
+        return {"query": query, "messages": messages, "users": users, "count": len(messages or users), "next_cursor": cursor}
+
+    @safe
+    async def dm_muted(self, limit: int = 20) -> dict:
+        data = await self.x.graphql("DmMutedTimeline", {"count": limit})
+        return {"conversations": _find_dm_conversations(data)[:limit]}
+
+    # ══════════════════════════════════════════════════════════
+    #  Bookmarks
+    # ══════════════════════════════════════════════════════════
+
+    @safe
+    async def bookmarks(self, limit: int = 20, cursor: Optional[str] = None) -> dict:
+        data = await self.x.graphql("Bookmarks", {"includePromotedContent": False, **_cursor_vars(cursor, limit)})
+        tweets, _, next_cursor = timeline(data)
+        return {"tweets": tweets, "count": len(tweets), "next_cursor": next_cursor}
+
+    @safe
+    async def search_bookmarks(self, query: str, limit: int = 20, cursor: Optional[str] = None) -> dict:
+        data = await self.x.graphql(
+            "BookmarkSearchTimeline",
+            {"rawQuery": query, **_cursor_vars(cursor, limit)},
+        )
+        tweets, _, next_cursor = timeline(data)
+        return {"tweets": tweets, "count": len(tweets), "next_cursor": next_cursor}
+
+    @safe
+    async def bookmark_folders(self) -> dict:
+        data = await self.x.graphql("BookmarkFoldersSlice", {})
+        folders = _find_folders(data)
+        result = {"folders": folders, "count": len(folders)}
+        warnings = data.get("_warnings") or []
+        if warnings:
+            result["note"] = "; ".join(warnings)[:300]
+        elif not folders:
+            result["note"] = "No bookmark folders. X gates bookmark collections (Premium) on most accounts."
+        return result
+
+    @safe
     async def create_bookmark_folder(self, name: str) -> dict:
-        """Create a bookmark folder."""
-        variables = {"name": name}
-        data = await self._post("createBookmarkFolder", variables)
-        if "error" in data:
-            return data
-        # Try multiple response paths for folder_id
-        folder_id = (
-            data.get("data", {}).get("bookmark_folder", {}).get("id")
-            or data.get("data", {}).get("create_bookmark_folder", {}).get("bookmark_folder", {}).get("id")
-        )
+        data = await self.x.graphql("createBookmarkFolder", {"name": name})
+        found = _find_folders(data)
+        folder_id = sid(found[0].get("folder_id")) if found else None
         if not folder_id:
-            # Deep search for id in bookmark_folder-like objects
-            def _find_folder_id(obj, depth=0):
-                if depth > 5: return None
-                if isinstance(obj, dict):
-                    if obj.get("__typename") == "BookmarkFolder" or ("id" in obj and "name" in obj):
-                        return obj.get("id")
-                    for v in obj.values():
-                        r = _find_folder_id(v, depth + 1)
-                        if r: return r
-                elif isinstance(obj, list):
-                    for item in obj:
-                        r = _find_folder_id(item, depth + 1)
-                        if r: return r
-                return None
-            folder_id = _find_folder_id(data)
+            raise XError("X did not return a folder id.", kind="upstream", hint=json.dumps(data.get("data") or {})[:200])
         return {"status": "created", "folder_id": folder_id, "name": name}
 
-    async def delete_bookmark_folder(self, folder_id: str) -> dict:
-        """Delete a bookmark folder."""
-        data = await self._post("DeleteBookmarkFolder", {"folder_id": folder_id})
-        return {"status": "deleted", "folder_id": folder_id}
-
+    @safe
     async def edit_bookmark_folder(self, folder_id: str, name: str) -> dict:
-        """Rename a bookmark folder."""
-        variables = {"folder_id": folder_id, "name": name}
-        data = await self._post("EditBookmarkFolder", variables)
+        data = await self.x.graphql("EditBookmarkFolder", {"bookmark_collection_id": folder_id, "name": name})
+        if not data.get("data"):
+            raise XError("X did not confirm the folder rename.", kind="upstream")
         return {"status": "updated", "folder_id": folder_id, "name": name}
 
-    async def add_tweet_to_folder(self, folder_id: str, tweet_id: int) -> dict:
-        """Add a tweet to a bookmark folder."""
-        variables = {"folder_id": folder_id, "tweet_id": str(tweet_id)}
-        data = await self._post("bookmarkTweetToFolder", variables)
-        return {"status": "added", "folder_id": folder_id, "tweet_id": tweet_id}
+    @safe
+    async def delete_bookmark_folder(self, folder_id: str) -> dict:
+        data = await self.x.graphql("DeleteBookmarkFolder", {"bookmark_collection_id": folder_id})
+        if not data.get("data"):
+            raise XError("X did not confirm the folder deletion.", kind="upstream")
+        return {"status": "deleted", "folder_id": folder_id}
 
-    async def remove_tweet_from_folder(self, folder_id: str, tweet_id: int) -> dict:
-        """Remove a tweet from a bookmark folder."""
-        variables = {"folder_id": folder_id, "tweet_id": str(tweet_id)}
-        data = await self._post("RemoveTweetFromBookmarkFolder", variables)
-        return {"status": "removed", "folder_id": folder_id, "tweet_id": tweet_id}
+    @safe
+    async def add_to_folder(self, folder_id: str, tweet_id: str) -> dict:
+        data = await self.x.graphql(
+            "bookmarkTweetToFolder", {"bookmark_collection_id": folder_id, "tweet_id": str(tweet_id)}
+        )
+        if not data.get("data"):
+            raise XError("X did not confirm adding the tweet to the folder.", kind="upstream")
+        return {"status": "added", "folder_id": folder_id, "tweet_id": str(tweet_id)}
 
-    async def clear_all_bookmarks(self) -> dict:
-        """Delete all bookmarks."""
-        data = await self._post("BookmarksAllDelete", {})
-        if "error" in data:
-            return data
+    @safe
+    async def remove_from_folder(self, folder_id: str, tweet_id: str) -> dict:
+        data = await self.x.graphql(
+            "RemoveTweetFromBookmarkFolder", {"bookmark_collection_id": folder_id, "tweet_id": str(tweet_id)}
+        )
+        if not data.get("data"):
+            raise XError("X did not confirm removing the tweet from the folder.", kind="upstream")
+        return {"status": "removed", "folder_id": folder_id, "tweet_id": str(tweet_id)}
+
+    @safe
+    async def folder_timeline(self, folder_id: str, limit: int = 20, cursor: Optional[str] = None) -> dict:
+        data = await self.x.graphql(
+            "BookmarkFolderTimeline",
+            {"bookmark_collection_id": folder_id, **_cursor_vars(cursor, limit)},
+        )
+        tweets, _, next_cursor = timeline(data)
+        result = {"folder_id": folder_id, "tweets": tweets, "count": len(tweets), "next_cursor": next_cursor}
+        if not tweets:
+            result["note"] = "Empty or unknown folder — X returns an empty collection instead of a 404."
+        return result
+
+    @safe
+    async def clear_bookmarks(self) -> dict:
+        data = await self.x.graphql("BookmarksAllDelete", {})
+        if (data.get("data") or {}).get("bookmark_all_delete") != "Done":
+            raise XError("X did not confirm clearing bookmarks.", kind="upstream")
         return {"status": "cleared"}
 
-    async def search_bookmarks(self, query: str, limit: int = 20) -> dict:
-        """Search bookmarks by text."""
-        variables = {"rawQuery": query, "count": limit}
-        data = await self._get("BookmarkSearchTimeline", variables)
-        if "error" in data:
-            return data
-        tweets = self._parse_any_timeline(data)
-        return {"tweets": tweets, "count": len(tweets)}
+    # ══════════════════════════════════════════════════════════
+    #  Scheduled tweets & drafts
+    # ══════════════════════════════════════════════════════════
 
-    # ── Lists (Delete) ──
+    @staticmethod
+    def _timestamp(execute_at: str) -> int:
+        try:
+            dt = datetime.fromisoformat(execute_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise XError(
+                f"Invalid datetime {execute_at!r}. Use ISO 8601, e.g. 2026-06-25T14:00:00Z",
+                kind="validation",
+            ) from exc
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
 
-    async def delete_list(self, list_id: int) -> dict:
-        """Delete a list."""
-        variables = {"listId": str(list_id)}
-        data = await self._post("DeleteList", variables)
-        return {"status": "deleted", "list_id": list_id}
+    @safe
+    async def schedule_tweet(
+        self, text: str, execute_at: str, reply_to: Optional[str] = None, media_ids: Optional[list[str]] = None
+    ) -> dict:
+        ts = self._timestamp(execute_at)
+        if ts <= int(time.time()):
+            raise XError("execute_at must be in the future.", kind="validation")
+        request: dict[str, Any] = {"status": text, "media_ids": [str(m) for m in media_ids or []]}
+        if reply_to:
+            request["reply"] = {"in_reply_to_tweet_id": str(reply_to)}
+        data = await self.x.graphql("CreateScheduledTweet", {"post_tweet_request": request, "execute_at": ts})
+        scheduled_id = None
+        payload = data.get("data") or {}
+        scheduled_id = sid((payload.get("scheduled_tweet") or {}).get("rest_id") or (payload.get("tweet") or {}).get("rest_id"))
+        return {
+            "status": "scheduled",
+            "scheduled_id": scheduled_id,
+            "execute_at": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+            "text": text,
+        }
 
-    # ── Topics ──
+    @safe
+    async def scheduled_tweets(self) -> dict:
+        data = await self.x.graphql("FetchScheduledTweets", {"ascending": False})
+        items = ((data.get("data") or {}).get("viewer") or {}).get("scheduled_tweet_list") or []
+        out = []
+        for item in items:
+            info = item.get("scheduling_info") or {}
+            request = item.get("tweet_create_request") or {}
+            out.append(
+                {
+                    "scheduled_id": sid(item.get("rest_id")),
+                    "text": request.get("status", ""),
+                    "execute_at": iso_time(info.get("execute_at")),
+                    "state": info.get("state"),
+                    "media_ids": request.get("media_ids") or [],
+                }
+            )
+        return {"scheduled_tweets": out, "count": len(out)}
 
-    async def follow_topic(self, topic_id: str) -> dict:
-        """Follow a topic."""
-        variables = {"topicId": topic_id}
-        await self._post("TopicFollow", variables)
-        return {"status": "followed", "topic_id": topic_id}
+    @safe
+    async def delete_scheduled_tweet(self, scheduled_id: str) -> dict:
+        data = await self.x.graphql("DeleteScheduledTweet", {"scheduled_tweet_id": str(scheduled_id)})
+        if (data.get("data") or {}).get("scheduledtweet_delete") != "Done":
+            raise XError("X did not confirm deleting the scheduled tweet.", kind="upstream")
+        return {"status": "deleted", "scheduled_id": str(scheduled_id)}
 
-    async def unfollow_topic(self, topic_id: str) -> dict:
-        """Unfollow a topic."""
-        variables = {"topicId": topic_id}
-        await self._post("TopicUnfollow", variables)
-        return {"status": "unfollowed", "topic_id": topic_id}
-
-    # ── Community Notes (Birdwatch) ──
-
-    async def create_community_note(self, tweet_id: int, text: str) -> dict:
-        """Create a community note on a tweet."""
-        variables = {
-            "data_v1": {
-                "summary": {"text": text},
-                "trustworthy_sources": False,
-                "misleading_tags": [],
+    @safe
+    async def edit_scheduled_tweet(self, scheduled_id: str, text: str, execute_at: str) -> dict:
+        ts = self._timestamp(execute_at)
+        data = await self.x.graphql(
+            "EditScheduledTweet",
+            {
+                "scheduled_tweet_id": str(scheduled_id),
+                "post_tweet_request": {"status": text, "media_ids": []},
+                "execute_at": ts,
             },
-            "tweet_id": str(tweet_id),
-        }
-        birdwatch_features = {
-            "responsive_web_birdwatch_media_notes_enabled": True,
-            "responsive_web_birdwatch_url_notes_enabled": False,
-            "responsive_web_grok_community_note_translation_is_enabled": True,
-            "responsive_web_birdwatch_fast_notes_badge_enabled": False,
-            "responsive_web_birdwatch_live_note_enabled": True,
-            "responsive_web_birdwatch_note_internal_insights_enabled": False,
-            "responsive_web_grok_community_note_auto_translation_is_enabled": True,
-            "responsive_web_graphql_timeline_navigation_enabled": True,
-            "profile_label_improvements_pcf_label_in_post_enabled": True,
-            "responsive_web_profile_redirect_enabled": False,
-            "rweb_tipjar_consumption_enabled": False,
-            "verified_phone_label_enabled": False,
-            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-        }
-        data = await self._post("BirdwatchCreateNote", variables, features=birdwatch_features)
-        if "error" in data:
-            return data
-        return {"status": "created", "tweet_id": tweet_id}
-
-    async def get_community_notes(self, tweet_id: int) -> dict:
-        """Get community notes on a tweet."""
-        variables = {"tweet_id": str(tweet_id)}
-        data = await self._post("BirdwatchFetchNotes", variables)
-        if "error" in data:
-            return data
-        notes = []
-        try:
-            # Parse community notes from response
-            note_results = (
-                data.get("data", {})
-                .get("birdwatch_notes", {})
-                .get("notes", [])
-            )
-            if not note_results:
-                # Alternative paths
-                note_results = data.get("data", {}).get("create_birdwatch_note", {}).get("notes", [])
-            if not note_results:
-                # Deep search for note-like objects
-                def find_notes(obj, depth=0):
-                    if depth > 8: return
-                    if isinstance(obj, dict):
-                        if "note_id" in obj or ("rest_id" in obj and "text" in obj):
-                            notes.append({
-                                "note_id": obj.get("note_id") or obj.get("rest_id"),
-                                "text": obj.get("text", ""),
-                                "created_at": obj.get("created_at"),
-                                "rating": obj.get("rating", {}),
-                            })
-                            return
-                        for v in obj.values():
-                            find_notes(v, depth + 1)
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            find_notes(item, depth + 1)
-                find_notes(data)
-            else:
-                for n in note_results:
-                    notes.append({
-                        "note_id": n.get("note_id") or n.get("rest_id"),
-                        "text": n.get("text", ""),
-                        "created_at": n.get("created_at"),
-                        "rating": n.get("rating", {}),
-                    })
-        except Exception as e:
-            logger.warning(f"Error parsing community notes: {e}")
-        if notes:
-            return {"notes": notes, "count": len(notes)}
-        return {"notes": [], "count": 0}
-
-    async def get_favoriters(self, tweet_id: int, limit: int = 20) -> dict:
-        """Get users who liked a tweet."""
-        variables = {"tweetId": str(tweet_id), "count": limit}
-        data = await self._get("Favoriters", variables)
-        if "error" in data:
-            return data
-        return self._parse_any_user_list(data)
-
-    async def get_tweet_edit_history(self, tweet_id: int) -> dict:
-        """Get edit history of a tweet."""
-        variables = {"tweetId": str(tweet_id)}
-        data = await self._get("TweetEditHistory", variables)
-        if "error" in data:
-            return data
-        return self._parse_tweet_edit_history(data)
-
-    async def get_similar_posts(self, tweet_id: int, limit: int = 20) -> dict:
-        """Get similar/related posts to a tweet."""
-        variables = {"tweet_id": str(tweet_id), "count": limit}
-        data = await self._get("SimilarPosts", variables)
-        if "error" in data:
-            return data
-        tweets = self._parse_any_timeline(data)
-        return {"tweets": tweets, "count": len(tweets)}
-
-    async def get_topic_info(self, topic_id: str) -> dict:
-        """Get topic details by ID."""
-        variables = {"topicId": topic_id}
-        data = await self._get("TopicByRestId", variables)
-        if "error" in data:
-            return data
-        topic = data.get("data", {}).get("topic", {})
-        if not topic:
-            return {"error": f"Topic {topic_id} not found"}
-        return {
-            "topic_id": topic.get("topic_id") or topic_id,
-            "name": topic.get("name", ""),
-            "following": topic.get("following", False),
-            "not_interested": topic.get("not_interested", False),
-        }
-
-    async def get_notifications(self, limit: int = 20) -> dict:
-        """Get notifications timeline."""
-        variables = {"count": limit, "withQuickPromoteEligibilityTweetFields": True, "timeline_type": "All"}
-        data = await self._get("NotificationsTimeline", variables)
-        if "error" in data:
-            return data
-        return self._parse_notifications(data)
-
-    async def get_user_tweets_and_replies(self, username: str, limit: int = 20) -> dict:
-        """Get a user's tweets and replies."""
-        from spectre.scraper import Scraper
-        scraper = Scraper(db_path=self.db_path, proxy=self.proxy)
-        # Use the scraper's GraphQL to get tweets and replies
-        user = await scraper.get_user(username)
-        if user is None:
-            return {"error": f"User @{username} not found"}
-        variables = {"userId": str(user.id), "count": limit, "includePromotedContent": False, "withVoice": True}
-        data = await self._get("UserTweetsAndReplies", variables)
-        if "error" in data:
-            return data
-        tweets = self._parse_any_timeline(data)
-        return {"tweets": tweets, "count": len(tweets)}
-
-    async def rate_community_note(self, note_id: str, rating: str) -> dict:
-        """Rate a community note. rating: 'helpful' or 'not_helpful'."""
-        variables = {
-            "note_id": note_id,
-            "rating": rating,
-        }
-        data = await self._post("BirdwatchCreateRating", variables)
-        return {"status": "rated", "note_id": note_id, "rating": rating}
-
-    # ── Account Settings & Profile ──
-
-    async def get_account_settings(self) -> dict:
-        """Get account settings via GraphQL (REST v1.1 was deprecated by X)."""
-        try:
-            accounts = await self.pool.get_all()
-            acc = None
-            for a in accounts:
-                if a.active and not a.error_msg:
-                    acc = a
-                    break
-            if not acc:
-                return {"error": "No active accounts available."}
-            from spectre.scraper import Scraper
-            scraper = Scraper(db_path=self.db_path, proxy=self.proxy)
-            result = await scraper.get_user(acc.username)
-            if result is None:
-                return {"error": f"User @{acc.username} not found"}
-            # result is a UserProfile Pydantic model
-            data = result.model_dump() if hasattr(result, "model_dump") else result
-            return {
-                "screen_name": data.get("username"),
-                "name": data.get("display_name"),
-                "description": data.get("bio"),
-                "location": data.get("location"),
-                "url": data.get("website"),
-                "followers_count": data.get("followers"),
-                "friends_count": data.get("following"),
-                "statuses_count": data.get("tweets"),
-                "note": "Account settings retrieved via GraphQL. REST v1.1 /account/settings.json was deprecated by X.",
-            }
-        except Exception as e:
-            return {"error": str(e)}
-
-    async def update_profile(self, name: str | None = None, bio: str | None = None, location: str | None = None, website: str | None = None) -> dict:
-        """Update profile info via REST API v1.1."""
-        from urllib.parse import urlencode
-        params = {}
-        if name is not None:
-            params["name"] = name[:50]
-        if bio is not None:
-            params["description"] = bio[:160]
-        if location is not None:
-            params["location"] = location[:30]
-        if website is not None:
-            params["url"] = website
-        if not params:
-            return {"error": "No fields to update. Provide name, bio, location, or website."}
-        client, acc_info = await self._get_session()
-        try:
-            # Set content-type for form-encoded data
-            client.headers["content-type"] = "application/x-www-form-urlencoded"
-            # Generate x-client-transaction-id (required for update_profile since late 2024)
-            path = "/i/api/1.1/account/update_profile.json"
-            try:
-                from twscrape.queue_client import XClIdGenStore
-                gen = await XClIdGenStore.get(acc_info["username"])
-                txn_id = gen.calc("POST", path)
-                client.headers["x-client-transaction-id"] = txn_id
-            except Exception as e:
-                logger.warning(f"Could not generate x-client-transaction-id: {e}")
-            urls = [
-                "https://api.x.com/1.1/account/update_profile.json",
-                "https://x.com/i/api/1.1/account/update_profile.json",
-                "https://api.twitter.com/1.1/account/update_profile.json",
-            ]
-            resp = None
-            for url in urls:
-                resp = await client.post(url, content=urlencode(params))
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return {
-                        "status": "updated",
-                        "name": data.get("name"),
-                        "bio": data.get("description"),
-                        "location": data.get("location"),
-                        "website": data.get("url"),
-                    }
-            return {"error": f"HTTP {resp.status_code if resp else 'no response'}", "detail": (resp.text[:300] if resp else ""), "tried": urls}
-        finally:
-            await client.aclose()
-
-    async def update_profile_image(self, file_path: str) -> dict:
-        """Update profile avatar image via REST API v1.1."""
-        import os
-        import mimetypes
-        if not os.path.exists(file_path):
-            return {"error": f"File not found: {file_path}"}
-        content_type = mimetypes.guess_type(file_path)[0] or "image/jpeg"
-        client, acc_info = await self._get_session()
-        try:
-            # Pop content-type so httpx sets multipart/form-data with boundary
-            original_ct = client.headers.pop("content-type", None)
-            with open(file_path, "rb") as f:
-                resp = await client.post(
-                    "https://api.twitter.com/1.1/account/update_profile_image.json",
-                    files={"image": (os.path.basename(file_path), f, content_type)},
-                )
-            if original_ct:
-                client.headers["content-type"] = original_ct
-            if resp.status_code != 200:
-                return {"error": f"HTTP {resp.status_code}", "detail": resp.text[:300]}
-            return {"status": "updated", "message": "Profile image updated successfully."}
-        finally:
-            await client.aclose()
-
-    async def update_profile_banner(self, file_path: str) -> dict:
-        """Update profile banner image via REST API v1.1."""
-        import os
-        import mimetypes
-        if not os.path.exists(file_path):
-            return {"error": f"File not found: {file_path}"}
-        content_type = mimetypes.guess_type(file_path)[0] or "image/jpeg"
-        client, acc_info = await self._get_session()
-        try:
-            # Pop content-type so httpx sets multipart/form-data with boundary
-            original_ct = client.headers.pop("content-type", None)
-            with open(file_path, "rb") as f:
-                resp = await client.post(
-                    "https://api.twitter.com/1.1/account/update_profile_banner.json",
-                    files={"banner": (os.path.basename(file_path), f, content_type)},
-                )
-            if original_ct:
-                client.headers["content-type"] = original_ct
-            if resp.status_code not in (200, 201):
-                return {"error": f"HTTP {resp.status_code}", "detail": resp.text[:300]}
-            return {"status": "updated", "message": "Profile banner updated successfully."}
-        finally:
-            await client.aclose()
-
-    async def delete_profile_banner(self) -> dict:
-        """Remove profile banner via REST API."""
-        client, acc_info = await self._get_session()
-        try:
-            resp = await client.post("https://api.twitter.com/1.1/account/remove_profile_banner.json")
-            if resp.status_code != 200:
-                return {"error": f"HTTP {resp.status_code}", "detail": resp.text[:300]}
-            return {"status": "deleted", "message": "Profile banner removed."}
-        finally:
-            await client.aclose()
-
-    # ── Muted & Blocked Accounts ──
-
-    async def get_muted_accounts(self, limit: int = 50) -> dict:
-        """Get list of muted accounts via GraphQL."""
-        variables = {"count": limit, "includePromotedContent": False}
-        data = await self._get("MutedAccounts", variables)
-        if "error" in data:
-            return data
-        return self._parse_user_list_from_timeline(data)
-
-    async def get_blocked_accounts(self, limit: int = 50) -> dict:
-        """Get list of blocked accounts via GraphQL."""
-        variables = {"count": limit}
-        data = await self._get("BlockedAccountsAll", variables)
-        if "error" in data:
-            return data
-        return self._parse_user_list_from_timeline(data)
-
-    def _parse_user_list_from_timeline(self, data: dict) -> dict:
-        """Extract user objects from GraphQL timeline response (muted/blocked lists)."""
-        users = []
-        try:
-            instructions = (
-                data.get("data", {})
-                .get("mutedUsers", {})
-                .get("timeline", {})
-                .get("timeline", {})
-                .get("instructions", [])
-            )
-            if not instructions:
-                # Try alternate path for blocked accounts
-                instructions = (
-                    data.get("data", {})
-                    .get("blockedAccounts", {})
-                    .get("timeline", {})
-                    .get("timeline", {})
-                    .get("instructions", [])
-                )
-            if not instructions:
-                # Try yet another nested path
-                instructions = (
-                    data.get("data", {})
-                    .get("user", {})
-                    .get("result", {})
-                    .get("timeline", {})
-                    .get("timeline", {})
-                    .get("instructions", [])
-                )
-
-            for instruction in instructions:
-                entries = instruction.get("entries", [])
-                if not entries:
-                    entries = instruction.get("moduleItems", [])
-                for entry in entries:
-                    content = entry.get("content", {})
-                    item_content = content.get("itemContent", content)
-                    # Direct user result
-                    user_result = None
-                    if "user_results" in item_content:
-                        user_result = item_content.get("user_results", {}).get("result", {})
-                    elif "user" in item_content:
-                        user_result = item_content.get("user", {}).get("result", {})
-                    # Also check content.items for nested entries
-                    if not user_result and "items" in content:
-                        for item in content["items"]:
-                            ic = item.get("item", {}).get("itemContent", {})
-                            ur = ic.get("user_results", {}).get("result", {})
-                            if ur and ur.get("rest_id"):
-                                users.append(self._extract_user_info(ur))
-                        continue
-
-                    if user_result and user_result.get("rest_id"):
-                        users.append(self._extract_user_info(user_result))
-        except Exception as e:
-            logger.warning(f"Error parsing user list from timeline: {e}")
-
-        return {"users": users, "count": len(users)}
-
-    @staticmethod
-    def _extract_user_info(user_result: dict) -> dict:
-        """Extract clean user info from a GraphQL user result object."""
-        legacy = user_result.get("legacy", {})
-        core = user_result.get("core", {})
-        # Two nesting patterns:
-        # 1. Tweet-embedded users: core.user_results.result.legacy (has screen_name)
-        # 2. Standalone user lists (BlueVerifiedFollowers, FollowersYouKnow, etc.):
-        #    core directly has {name, screen_name, created_at}
-        core_result = core.get("user_results", {}).get("result", {})
-        core_legacy = core_result.get("legacy", {}) if core_result else {}
-        return {
-            "user_id": user_result.get("rest_id"),
-            "username": legacy.get("screen_name") or core_legacy.get("screen_name") or core.get("screen_name"),
-            "name": legacy.get("name") or core_legacy.get("name") or core.get("name"),
-            "description": legacy.get("description") or core_legacy.get("description"),
-            "followers_count": legacy.get("followers_count", 0) or core_legacy.get("followers_count", 0),
-            "following_count": legacy.get("friends_count", 0) or core_legacy.get("friends_count", 0),
-            "statuses_count": legacy.get("statuses_count", 0) or core_legacy.get("statuses_count", 0),
-            "profile_image_url": legacy.get("profile_image_url_https") or core_legacy.get("profile_image_url_https"),
-            "verified": legacy.get("verified", False) or core_legacy.get("verified", False),
-            "blue_verified": user_result.get("is_blue_verified", False),
-        }
-    @staticmethod
-    def _find_instructions(data):
-        """Recursively find all 'instructions' arrays in a GraphQL response."""
-        results = []
-        if isinstance(data, dict):
-            for key, val in data.items():
-                if key == "instructions" and isinstance(val, list):
-                    results.extend(val)
-                else:
-                    results.extend(Writer._find_instructions(val))
-        elif isinstance(data, list):
-            for item in data:
-                results.extend(Writer._find_instructions(item))
-        return results
-
-    def _parse_any_timeline(self, data: dict) -> list:
-        """Parse tweets from ANY GraphQL timeline response (generic)."""
-        tweets = []
-        try:
-            instructions = self._find_instructions(data)
-            for instruction in instructions:
-                entries = instruction.get("entries", [])
-                if not entries:
-                    entries = instruction.get("moduleItems", [])
-                for entry in entries:
-                    content = entry.get("content", {})
-                    entry_type = content.get("entryType", "")
-                    if "Cursor" in entry_type:
-                        continue
-                    item_content = content.get("itemContent", {})
-                    tweet_result = (
-                        item_content.get("tweet_results", {}).get("result", {})
-                    )
-                    if tweet_result and tweet_result.get("rest_id"):
-                        tweets.append(self._extract_tweet_info(tweet_result))
-                        continue
-                    # Timeline module (conversation threads)
-                    if "items" in content:
-                        for item in content["items"]:
-                            ic = item.get("item", {}).get("itemContent", {})
-                            tr = ic.get("tweet_results", {}).get("result", {})
-                            if tr and tr.get("rest_id"):
-                                tweets.append(self._extract_tweet_info(tr))
-        except Exception as e:
-            logger.warning(f"Error parsing timeline tweets (generic): {e}")
-        return tweets
-
-    def _parse_any_user_list(self, data: dict) -> dict:
-        """Parse user objects from ANY GraphQL response (generic)."""
-        users = []
-        seen = set()
-        try:
-            instructions = self._find_instructions(data)
-            for instruction in instructions:
-                entries = instruction.get("entries", [])
-                if not entries:
-                    entries = instruction.get("moduleItems", [])
-                for entry in entries:
-                    content = entry.get("content", {})
-                    entry_type = content.get("entryType", "")
-                    if "Cursor" in entry_type:
-                        continue
-                    item_content = content.get("itemContent", content)
-                    user_result = None
-                    if "user_results" in item_content:
-                        user_result = item_content.get("user_results", {}).get("result", {})
-                    elif "user" in item_content:
-                        user_result = item_content.get("user", {}).get("result", {})
-                    # Check nested items
-                    if not user_result and "items" in content:
-                        for item in content["items"]:
-                            ic = item.get("item", {}).get("itemContent", {})
-                            ur = ic.get("user_results", {}).get("result", {})
-                            if ur and ur.get("rest_id") and ur["rest_id"] not in seen:
-                                seen.add(ur["rest_id"])
-                                users.append(self._extract_user_info(ur))
-                        continue
-                    if user_result and user_result.get("rest_id"):
-                        if user_result["rest_id"] not in seen:
-                            seen.add(user_result["rest_id"])
-                            users.append(self._extract_user_info(user_result))
-        except Exception as e:
-            logger.warning(f"Error parsing user list (generic): {e}")
-        return {"users": users, "count": len(users)}
-
-    def _parse_bookmark_folders(self, data: dict) -> dict:
-        """Parse bookmark folders from GraphQL response."""
-        folders = []
-        try:
-            # Try standard path
-            collections = (
-                data.get("data", {}).get("bookmark_collections_v2", {})
-                .get("bookmark_collections", [])
-            )
-            if not collections:
-                collections = data.get("data", {}).get("bookmark_folders", {}).get("folders", [])
-            if collections:
-                for c in collections:
-                    folders.append({
-                        "id": c.get("id") or c.get("bookmark_collection_id"),
-                        "name": c.get("name"),
-                        "visibility": c.get("visibility"),
-                    })
-            else:
-                # Deep search for folder-like objects
-                def find_folders(obj, depth=0):
-                    if depth > 10 or len(folders) > 0:
-                        return
-                    if isinstance(obj, dict):
-                        if "name" in obj and "id" in obj and ("visibility" in obj or "sort_index" in obj):
-                            folders.append({
-                                "id": obj.get("id"),
-                                "name": obj.get("name"),
-                                "visibility": obj.get("visibility", "ALL"),
-                            })
-                            return
-                        for v in obj.values():
-                            find_folders(v, depth + 1)
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            find_folders(item, depth + 1)
-                find_folders(data)
-        except Exception as e:
-            logger.warning(f"Error parsing bookmark folders: {e}")
-        return {"folders": folders, "count": len(folders)}
-
-    def _parse_notifications(self, data: dict) -> dict:
-        """Parse notifications from GraphQL response."""
-        notifications = []
-        try:
-            instructions = self._find_instructions(data)
-            for instruction in instructions:
-                entries = instruction.get("entries", [])
-                if not entries:
-                    entries = instruction.get("moduleItems", [])
-                for entry in entries:
-                    content = entry.get("content", {})
-                    entry_type = content.get("entryType", "")
-                    if "Cursor" in entry_type:
-                        continue
-                    item_content = content.get("itemContent", {})
-                    if not item_content:
-                        for module_item in content.get("items", []):
-                            ic = module_item.get("item", {}).get("itemContent", {})
-                            if ic:
-                                item_content = ic
-                                break
-
-                    notif_type = item_content.get("notificationType", "")
-                    tweet_results = item_content.get("tweet_results", {})
-                    user_results = item_content.get("user_results", {})
-
-                    notif = {
-                        "type": notif_type,
-                        "id": entry.get("entryId", ""),
-                    }
-
-                    tr = tweet_results.get("result", {})
-                    if tr and tr.get("rest_id"):
-                        notif["tweet"] = self._extract_tweet_info(tr)
-
-                    ur = user_results.get("result", {})
-                    if ur and ur.get("rest_id"):
-                        notif["user"] = self._extract_user_info(ur)
-
-                    # Multiple results (like/retweet groups)
-                    if "items" in content:
-                        for item in content["items"]:
-                            ic = item.get("item", {}).get("itemContent", {})
-                            tr2 = ic.get("tweet_results", {}).get("result", {})
-                            if tr2 and tr2.get("rest_id"):
-                                notif.setdefault("tweets", []).append(self._extract_tweet_info(tr2))
-                            ur2 = ic.get("user_results", {}).get("result", {})
-                            if ur2 and ur2.get("rest_id"):
-                                notif.setdefault("users", []).append(self._extract_user_info(ur2))
-
-                    if notif_type or notif.get("tweet") or notif.get("user") or notif.get("tweets") or notif.get("users"):
-                        notifications.append(notif)
-        except Exception as e:
-            logger.warning(f"Error parsing notifications: {e}")
-        return {"notifications": notifications, "count": len(notifications)}
-
-    def _parse_tweet_edit_history(self, data: dict) -> dict:
-        """Parse tweet edit history from GraphQL response."""
-        edits = []
-        try:
-            tweet_result = (
-                data.get("data", {})
-                .get("tweet_result", {})
-                .get("result", {})
-            )
-            if not tweet_result:
-                tweet_result = (
-                    data.get("data", {})
-                    .get("tweetResults", {})
-                    .get("result", {})
-                )
-            if tweet_result:
-                edit_info = tweet_result.get("legacy", {}).get("edit_info", {})
-                edit_ids = edit_info.get("edit_ids", [])
-                initial = edit_info.get("initial_tweet_id")
-                if initial:
-                    edits.append({"tweet_id": initial, "is_original": True})
-                for eid in edit_ids:
-                    if eid != initial:
-                        edits.append({"tweet_id": eid, "is_original": False})
-        except Exception as e:
-            logger.warning(f"Error parsing edit history: {e}")
-        return {"edits": edits, "count": len(edits)}
-
-    def _parse_dm_messages(self, data: dict) -> dict:
-        """Parse DM search/message results from GraphQL response."""
-        messages = []
-        try:
-            instructions = self._find_instructions(data)
-            for instruction in instructions:
-                entries = instruction.get("entries", [])
-                if not entries:
-                    entries = instruction.get("moduleItems", [])
-                for entry in entries:
-                    content = entry.get("content", {})
-                    entry_type = content.get("entryType", "")
-                    if "Cursor" in entry_type:
-                        continue
-                    item_content = content.get("itemContent", content)
-                    msg = {
-                        "id": entry.get("entryId", ""),
-                        "text": item_content.get("text", ""),
-                        "sender_id": item_content.get("sender_id", ""),
-                        "conversation_id": item_content.get("conversation_id", ""),
-                        "timestamp": item_content.get("time", ""),
-                    }
-                    if msg["text"] or msg["sender_id"]:
-                        messages.append(msg)
-                    # Nested items
-                    if "items" in content:
-                        for item in content["items"]:
-                            ic = item.get("item", {}).get("itemContent", {})
-                            msg2 = {
-                                "id": item.get("entryId", ""),
-                                "text": ic.get("text", ""),
-                                "sender_id": ic.get("sender_id", ""),
-                                "conversation_id": ic.get("conversation_id", ""),
-                                "timestamp": ic.get("time", ""),
-                            }
-                            if msg2["text"] or msg2["sender_id"]:
-                                messages.append(msg2)
-        except Exception as e:
-            logger.warning(f"Error parsing DM messages: {e}")
-        return {"messages": messages, "count": len(messages)}
-
-    def _parse_dm_conversations(self, data: dict) -> dict:
-        """Parse DM conversation list from GraphQL response."""
-        conversations = []
-        try:
-            instructions = self._find_instructions(data)
-            for instruction in instructions:
-                entries = instruction.get("entries", [])
-                if not entries:
-                    entries = instruction.get("moduleItems", [])
-                for entry in entries:
-                    content = entry.get("content", {})
-                    entry_type = content.get("entryType", "")
-                    if "Cursor" in entry_type:
-                        continue
-                    item_content = content.get("itemContent", content)
-                    convo = {
-                        "id": entry.get("entryId", ""),
-                        "name": item_content.get("name", ""),
-                        "participants": item_content.get("participants", []),
-                    }
-                    if convo["id"] and not convo["id"].startswith("cursor"):
-                        conversations.append(convo)
-        except Exception as e:
-            logger.warning(f"Error parsing DM conversations: {e}")
-        return {"conversations": conversations, "count": len(conversations)}
-
-
-    # ── DM Operations (extended) ──
-
-    async def search_dm(self, query: str, limit: int = 20) -> dict:
-        """Search DMs by text query."""
-        variables = {"query": query, "count": limit, "withAttachments": False, "withConversationQueryHighlights": False, "withMessageQueryHighlights": False}
-        data = await self._get("DmAllSearchSlice", variables)
-        if "error" in data:
-            return data
-        return self._parse_dm_messages(data)
-
-    async def remove_follower(self, user_id: int) -> dict:
-        """Remove a follower from your account."""
-        variables = {"target_user_id": str(user_id)}
-        await self._post("RemoveFollower", variables)
-        return {"status": "removed_follower", "user_id": user_id}
-
-    async def pin_reply(self, tweet_id: int) -> dict:
-        """Pin a reply to a conversation."""
-        variables = {"tweetId": str(tweet_id)}
-        await self._post("PinReply", variables)
-        return {"status": "pinned_reply", "tweet_id": tweet_id}
-
-    async def unpin_reply(self, tweet_id: int) -> dict:
-        """Unpin a reply from a conversation."""
-        variables = {"tweetId": str(tweet_id)}
-        await self._post("UnpinReply", variables)
-        return {"status": "unpinned_reply", "tweet_id": tweet_id}
-
-    async def get_followers_you_know(self, user_id: int, limit: int = 20) -> dict:
-        """Get mutual followers (followers you know)."""
-        variables = {"userId": str(user_id), "count": limit, "includePromotedContent": False}
-        data = await self._get("FollowersYouKnow", variables, features=TIMELINE_FEATURES, field_toggles=TIMELINE_FIELD_TOGGLES)
-        if "error" in data:
-            return data
-        return self._parse_any_user_list(data)
-
-    async def dm_block_user(self, user_id: int) -> dict:
-        """Block a user in DMs (prevents them from messaging you)."""
-        variables = {"userId": str(user_id)}
-        await self._post("dmBlockUser", variables)
-        return {"status": "dm_blocked", "user_id": user_id}
-
-    async def dm_unblock_user(self, user_id: int) -> dict:
-        """Unblock a user in DMs."""
-        variables = {"userId": str(user_id)}
-        await self._post("dmUnblockUser", variables)
-        return {"status": "dm_unblocked", "user_id": user_id}
-
-    async def search_dm_groups(self, query: str, limit: int = 20) -> dict:
-        """Search DMs in group conversations."""
-        variables = {"query": query, "count": limit, "withAttachments": False, "withConversationQueryHighlights": False}
-        data = await self._get("DmGroupSearchSlice", variables)
-        if "error" in data:
-            return data
-        return self._parse_dm_conversations(data)
-
-    async def get_dm_muted(self, limit: int = 20) -> dict:
-        """Get muted DM conversations."""
-        variables = {"count": limit}
-        data = await self._get("DmMutedTimeline", variables)
-        if "error" in data:
-            return data
-        return self._parse_dm_conversations(data)
-
-    async def search_dm_people(self, query: str, limit: int = 20) -> dict:
-        """Search for people in DMs."""
-        variables = {"query": query, "count": limit, "withConversationQueryHighlights": False}
-        data = await self._get("DmPeopleSearchSlice", variables)
-        if "error" in data:
-            return data
-        return self._parse_any_user_list(data)
-
-    # ── Pin / Unpin Tweet ──
-
-    async def pin_tweet(self, tweet_id: int) -> dict:
-        """Pin a tweet to your profile."""
-        variables = {"tweet_id": str(tweet_id)}
-        await self._post("PinTweet", variables)
-        return {"status": "pinned", "tweet_id": tweet_id}
-
-    async def unpin_tweet(self, tweet_id: int) -> dict:
-        """Unpin a tweet from your profile."""
-        variables = {"tweet_id": str(tweet_id)}
-        await self._post("UnpinTweet", variables)
-        return {"status": "unpinned", "tweet_id": tweet_id}
-
-    # ── Profile Highlights ──
-
-    async def create_highlight(self, tweet_ids: list[int]) -> dict:
-        """Add tweets to your profile highlights."""
-        results = []
-        for tid in tweet_ids:
-            variables = {"tweet_id": str(tid)}
-            data = await self._post("CreateHighlight", variables)
-            if "error" in data:
-                results.append({"tweet_id": tid, "error": data["error"]})
-            else:
-                results.append({"tweet_id": tid, "status": "added"})
-        return {"highlights": results, "count": len(results)}
-
-    async def delete_highlight(self, highlight_id: str) -> dict:
-        """Remove a highlight from your profile."""
-        variables = {"highlightId": highlight_id}
-        await self._post("DeleteHighlight", variables)
-        return {"status": "deleted", "highlight_id": highlight_id}
-
-    async def get_user_highlights(self, user_id: int, limit: int = 20) -> dict:
-        """Get a user's profile highlights."""
-        variables = {"userId": str(user_id), "count": limit, "includePromotedContent": False, "withVoice": False}
-        data = await self._get("UserHighlightsTweets", variables)
-        if "error" in data:
-            return data
-        tweets = self._parse_any_timeline(data)
-        return {"tweets": tweets, "count": len(tweets)}
-
-    # ── Verified Followers ──
-
-    async def get_verified_followers(self, user_id: int, limit: int = 20) -> dict:
-        """Get Blue-verified followers of a user."""
-        variables = {"userId": str(user_id), "count": limit, "includePromotedContent": False}
-        data = await self._get("BlueVerifiedFollowers", variables)
-        if "error" in data:
-            return data
-        return self._parse_any_user_list(data)
-
-    # ── User Likes ──
-
-    async def get_user_likes(self, user_id: int, limit: int = 20) -> dict:
-        """Get a user's liked tweets."""
-        variables = {"userId": str(user_id), "count": limit, "includePromotedContent": False, "withQuickPromoteEligibilityTweetFields": True, "withVoice": True, "withV2Timeline": True}
-        features = {
-            "rweb_video_screen_enabled": False, "rweb_cashtags_enabled": True,
-            "profile_label_improvements_pcf_label_in_post_enabled": True,
-            "responsive_web_graphql_timeline_navigation_enabled": True,
-            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-            "premium_content_api_read_enabled": False,
-            "view_counts_everywhere_api_enabled": True,
-            "longform_notetweets_consumption_enabled": True,
-            "responsive_web_edit_tweet_api_enabled": True,
-            "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
-            "responsive_web_enhance_cards_enabled": False,
-        }
-        data = await self._get("Likes", variables, features=features)
-        if "error" in data:
-            return data
-        tweets = self._parse_any_timeline(data)
-        return {"tweets": tweets, "count": len(tweets)}
-
-    # ── Bookmark Folder Timeline ──
-
-    async def get_bookmark_folder_timeline(self, folder_id: str, limit: int = 20) -> dict:
-        """Get tweets in a bookmark folder."""
-        variables = {"bookmark_collection_id": folder_id, "count": limit}
-        data = await self._get("BookmarkFolderTimeline", variables)
-        if "error" in data:
-            return data
-        tweets = self._parse_any_timeline(data)
-        return {"tweets": tweets, "count": len(tweets)}
-
-    # ── Home Timeline ──
-
-    async def get_home_timeline(self, limit: int = 20) -> dict:
-        """Get the authenticated user's home timeline via GraphQL."""
-        variables = {
-            "count": limit,
-            "includePromotedContent": True,
-            "latestControlAvailable": True,
-            "requestContext": "launch",
-            "withCommunity": True,
-        }
-        features = {
-            "rweb_video_screen_enabled": False,
-            "profile_label_improvements_pcf_label_in_post_enabled": True,
-            "responsive_web_graphql_timeline_navigation_enabled": True,
-            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-            "premium_content_api_read_enabled": False,
-            "view_counts_everywhere_api_enabled": True,
-            "longform_notetweets_consumption_enabled": True,
-            "responsive_web_edit_tweet_api_enabled": True,
-            "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
-            "responsive_web_enhance_cards_enabled": False,
-        }
-        data = await self._get("HomeTimeline", variables, features=features)
-        if "error" in data:
-            return data
-        # Parse tweets from timeline entries
-        tweets = self._parse_timeline_tweets(data)
-        return {"tweets": tweets, "count": len(tweets)}
-
-    def _parse_timeline_tweets(self, data: dict) -> list[dict]:
-        """Parse tweets from a GraphQL timeline response."""
-        tweets = []
-        try:
-            instructions = (
-                data.get("data", {})
-                .get("home", {})
-                .get("home_timeline_urt", {})
-                .get("instructions", [])
-            )
-            if not instructions:
-                instructions = (
-                    data.get("data", {})
-                    .get("timeline", {})
-                    .get("timeline", {})
-                    .get("instructions", [])
-                )
-
-            for instruction in instructions:
-                entries = instruction.get("entries", [])
-                if not entries:
-                    entries = instruction.get("moduleItems", [])
-                for entry in entries:
-                    content = entry.get("content", {})
-                    # Direct tweet
-                    item_content = content.get("itemContent", {})
-                    tweet_result = (
-                        item_content.get("tweet_results", {}).get("result", {})
-                    )
-                    if tweet_result and tweet_result.get("rest_id"):
-                        tweets.append(self._extract_tweet_info(tweet_result))
-                        continue
-                    # Timeline module (e.g., conversation threads)
-                    if "items" in content:
-                        for item in content["items"]:
-                            ic = item.get("item", {}).get("itemContent", {})
-                            tr = ic.get("tweet_results", {}).get("result", {})
-                            if tr and tr.get("rest_id"):
-                                tweets.append(self._extract_tweet_info(tr))
-        except Exception as e:
-            logger.warning(f"Error parsing timeline tweets: {e}")
-
-        return tweets
-
-    @staticmethod
-    def _extract_tweet_info(tweet_result: dict) -> dict:
-        """Extract clean tweet info from a GraphQL tweet result object."""
-        legacy = tweet_result.get("legacy", {})
-        user_legacy = (
-            tweet_result.get("core", {})
-            .get("user_results", {})
-            .get("result", {})
-            .get("legacy", {})
         )
-        # Fallback: some responses (notifications) nest user differently
-        if not user_legacy.get("screen_name"):
-            alt_result = tweet_result.get("core", {}).get("user_results", {}).get("result", {})
-            if alt_result:
-                alt_core = alt_result.get("core", {}).get("user_results", {}).get("result", {})
-                if alt_core:
-                    user_legacy = alt_core.get("legacy", {}) or user_legacy
-        return {
-            "tweet_id": tweet_result.get("rest_id"),
-            "text": legacy.get("full_text", ""),
-            "author_username": user_legacy.get("screen_name"),
-            "author_name": user_legacy.get("name"),
-            "created_at": legacy.get("created_at"),
-            "retweet_count": legacy.get("retweet_count", 0),
-            "like_count": legacy.get("favorite_count", 0),
-            "reply_count": legacy.get("reply_count", 0),
-            "quote_count": legacy.get("quote_count", 0),
-            "view_count": tweet_result.get("views", {}).get("count"),
-            "lang": legacy.get("lang"),
-            "url": f"https://x.com/i/status/{tweet_result.get('rest_id')}",
-        }
+        if not data.get("data"):
+            raise XError("X did not confirm the edit.", kind="upstream")
+        return {"status": "edited", "scheduled_id": str(scheduled_id), "execute_at": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()}
 
-    # ── Trends ──
+    @safe
+    async def create_draft(self, text: str) -> dict:
+        data = await self.x.graphql("CreateDraftTweet", {"post_tweet_request": {"status": text, "media_ids": []}})
+        draft_id = sid(((data.get("data") or {}).get("tweet") or {}).get("rest_id"))
+        if not draft_id:
+            raise XError("X did not return a draft id.", kind="upstream")
+        return {"status": "draft_created", "draft_id": draft_id, "text": text}
 
-    async def get_trends(self, category: str = "trending", limit: int = 20) -> dict:
-        """Get trending topics via REST API.
+    @safe
+    async def drafts(self) -> dict:
+        data = await self.x.graphql("FetchDraftTweets", {"ascending": False})
+        items = ((data.get("data") or {}).get("viewer") or {}).get("draft_list", {}).get("response_data") or []
+        out = []
+        for item in items:
+            request = item.get("tweet_create_request") or {}
+            out.append({"draft_id": sid(item.get("rest_id")), "text": request.get("status", ""), "media_ids": request.get("media_ids") or []})
+        return {"drafts": out, "count": len(out)}
 
-        Args:
-            category: 'trending', 'news', 'sport', or 'entertainment'.
-            limit: Max trends to return.
-        """
-        # Map category to WOEID (Where On Earth ID) — 1 = worldwide
-        url = "https://api.twitter.com/1.1/trends/place.json"
-        client, acc_info = await self._get_session()
-        try:
-            resp = await client.get(url, params={"id": "1"})
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("x-rate-limit-reset", 0))
-                return _rate_limit_error("trends", retry_after)
-            if resp.status_code != 200:
-                return {"error": f"HTTP {resp.status_code}", "detail": resp.text[:300]}
+    @safe
+    async def delete_draft(self, draft_id: str) -> dict:
+        data = await self.x.graphql("DeleteDraftTweet", {"draft_tweet_id": str(draft_id)})
+        if (data.get("data") or {}).get("drafttweet_delete") != "Done":
+            raise XError("X did not confirm deleting the draft.", kind="upstream")
+        return {"status": "deleted", "draft_id": str(draft_id)}
 
-            data = resp.json()
-            if not data or not isinstance(data, list):
-                return {"trends": [], "count": 0}
+    @safe
+    async def edit_draft(self, draft_id: str, text: str) -> dict:
+        data = await self.x.graphql(
+            "EditDraftTweet", {"draft_tweet_id": str(draft_id), "post_tweet_request": {"status": text, "media_ids": []}}
+        )
+        if not data.get("data"):
+            raise XError("X did not confirm the draft edit.", kind="upstream")
+        return {"status": "edited", "draft_id": str(draft_id), "text": text}
 
-            trends_data = data[0].get("trends", [])
-            trends = []
-            for t in trends_data[:limit]:
-                trends.append({
+    # ══════════════════════════════════════════════════════════
+    #  Notifications
+    # ══════════════════════════════════════════════════════════
+
+    @safe
+    async def notifications(self, limit: int = 20, cursor: Optional[str] = None, kind: str = "All") -> dict:
+        data = await self.x.graphql(
+            "NotificationsTimeline",
+            {"timeline_type": kind, **_cursor_vars(cursor, limit)},
+        )
+        items = parse_notifications(data)
+        _, _, next_cursor = timeline(data)
+        return {"notifications": items[:limit], "count": min(len(items), limit), "next_cursor": next_cursor}
+
+    # ══════════════════════════════════════════════════════════
+    #  Trends
+    # ══════════════════════════════════════════════════════════
+
+    TREND_CATEGORIES = {"trending": 0, "news": 1, "sport": 2, "entertainment": 3}
+
+    @safe
+    async def trends(self, woeid: int = 1, limit: int = 20) -> dict:
+        payload = await self.x.rest("GET", "trends/place.json", params={"id": str(woeid)})
+        if not isinstance(payload, list) or not payload:
+            raise XError(f"No trends for woeid {woeid}.", kind="not_found", hint="Use get_trend_locations to find a woeid.")
+        place = payload[0]
+        trends = []
+        for t in (place.get("trends") or [])[:limit]:
+            trends.append(
+                {
                     "name": t.get("name"),
+                    "query": t.get("query"),
                     "tweet_count": t.get("tweet_volume"),
                     "url": t.get("url"),
-                    "category": category,
-                })
-            return {"trends": trends, "count": len(trends)}
-        finally:
-            await client.aclose()
+                    "promoted": bool(t.get("promoted_content")),
+                }
+            )
+        return {"woeid": woeid, "location": place.get("locations", [{}])[0].get("name"), "trends": trends, "count": len(trends)}
 
-    # ── Media Upload ──
+    @safe
+    async def trend_locations(self) -> dict:
+        payload = await self.x.rest("GET", "trends/available.json")
+        rows = [{"woeid": l.get("woeid"), "name": l.get("name"), "country": l.get("country"), "place_type": l.get("placeType", {}).get("name")} for l in payload]
+        rows.sort(key=lambda r: (r["country"] or "", r["name"] or ""))
+        return {"locations": rows, "count": len(rows)}
 
-    async def upload_media(self, file_path: str) -> dict:
-        """Upload media (image/video/GIF) for use in tweets.
+    # ══════════════════════════════════════════════════════════
+    #  Profile
+    # ══════════════════════════════════════════════════════════
 
-        Uses cookie-based auth with curl_cffi for TLS fingerprinting.
-        3-phase upload: INIT → APPEND (4MB chunks) → FINALIZE.
-        For videos, polls processing status until complete.
-        """
-        import mimetypes
-        import os
+    @safe
+    async def update_profile(
+        self, name: Optional[str] = None, bio: Optional[str] = None, location: Optional[str] = None, website: Optional[str] = None
+    ) -> dict:
+        params: dict[str, str] = {}
+        if name:
+            params["name"] = name[:50]
+        if bio is not None:
+            if any(ch in bio for ch in "<>&"):
+                raise XError("Bio cannot contain < > or & — X rejects those characters.", kind="validation", code=120)
+            params["description"] = bio[:160]
+        if location:
+            params["location"] = location[:30]
+        if website:
+            params["url"] = website
+        if not params:
+            raise XError("Nothing to update: pass name, bio, location or website.", kind="validation")
 
+        client = await self._session_client()
+        headers = {"content-type": "application/x-www-form-urlencoded", **(await self._tx_headers("/1.1/account/update_profile.json"))}
+        resp = await client.post(f"{REST}/account/update_profile.json", data=params, headers=headers)
+        if resp.status_code != 200:
+            payload = _json_or_text(resp)
+            if isinstance(payload, dict) and payload.get("errors"):
+                raise from_x_error(payload["errors"][0], operation="update_profile")
+            raise XError(f"HTTP {resp.status_code} from update_profile", kind="upstream", status=resp.status_code, hint=str(payload)[:200])
+        payload = resp.json()
+        return {
+            "status": "updated",
+            "name": payload.get("name"),
+            "bio": payload.get("description"),
+            "location": payload.get("location"),
+            "website": payload.get("url"),
+        }
+
+    @safe
+    async def update_profile_image(self, file_path: str) -> dict:
+        return await self._update_profile_media(file_path, "image", "update_profile_image.json")
+
+    @safe
+    async def update_profile_banner(self, file_path: str) -> dict:
+        return await self._update_profile_media(file_path, "banner", "update_profile_banner.json")
+
+    async def _update_profile_media(self, file_path: str, field: str, endpoint: str) -> dict:
         if not os.path.exists(file_path):
-            return {"error": f"File not found: {file_path}"}
+            raise XError(f"File not found: {file_path}", kind="validation")
+        content_type = mimetypes.guess_type(file_path)[0] or "image/jpeg"
+        client = await self._session_client()
+        original = client.headers.pop("content-type", None)
+        headers = await self._tx_headers(f"/1.1/account/{endpoint}")
+        try:
+            with open(file_path, "rb") as fh:
+                resp = await client.post(
+                    f"{REST}/account/{endpoint}",
+                    files={field: (os.path.basename(file_path), fh, content_type)},
+                    headers=headers,
+                )
+            if original:
+                client.headers["content-type"] = original
+            if resp.status_code not in (200, 201):
+                payload = _json_or_text(resp)
+                raise XError(
+                    f"HTTP {resp.status_code} updating profile {field}",
+                    kind="upstream",
+                    status=resp.status_code,
+                    hint=str(payload)[:200],
+                )
+            return {"status": "updated", "field": field, "file": file_path}
+        finally:
+            pass
 
-        content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
-        file_size = os.path.getsize(file_path)
+    @safe
+    async def delete_profile_banner(self) -> dict:
+        client = await self._session_client()
+        headers = await self._tx_headers("/1.1/account/remove_profile_banner.json")
+        resp = await client.post(f"{REST}/account/remove_profile_banner.json", data={}, headers=headers)
+        if resp.status_code != 200:
+            raise XError(f"HTTP {resp.status_code} removing banner", kind="upstream", status=resp.status_code, hint=resp.text[:200])
+        return {"status": "deleted", "field": "banner"}
 
-        # Use upload2.json for videos, upload.json for images
-        is_video = content_type.startswith("video/")
-        upload_url = "https://upload.twitter.com/i/media/upload2.json" if is_video else "https://upload.twitter.com/i/media/upload.json"
-
-        # Get authenticated session info
-        accounts = await self.pool.get_all()
-        acc = None
-        for a in accounts:
-            if a.active and not a.error_msg:
-                acc = a
-                break
+    async def _tx_headers(self, path: str) -> dict:
+        """x-client-transaction-id is mandatory on the account/* REST writes."""
+        accounts = await self.x.pool.get_all()
+        acc = next((a for a in accounts if a.active and not a.error_msg), None)
         if not acc:
-            return {"error": "No active accounts available."}
+            raise XError("No active accounts.", kind="auth")
+        tx = await self.x._txid(acc)
+        return {"x-client-transaction-id": tx.calc("POST", path)} if tx else {}
 
-        cookies = acc.cookies
-        if isinstance(cookies, str):
-            cookies = json.loads(cookies)
+    async def _session_client(self):
+        """A raw client for multipart/form-encoded profile calls."""
+        accounts = await self.x.pool.get_all()
+        acc = next((a for a in accounts if a.active and not a.error_msg), None)
+        if not acc:
+            raise XError("No active accounts.", kind="auth")
+        return await self.x._client(acc)
 
-        cookie_string = f"auth_token={cookies.get('auth_token', '')}; ct0={cookies.get('ct0', '')}"
-        csrf = cookies.get("ct0", "")
+    # ══════════════════════════════════════════════════════════
+    #  Media
+    # ══════════════════════════════════════════════════════════
+
+    @safe
+    async def upload_media(self, file_path: str) -> dict:
+        """3-phase cookie-auth upload: INIT -> APPEND (4 MiB chunks) -> FINALIZE."""
+        if not os.path.exists(file_path):
+            raise XError(f"File not found: {file_path}", kind="validation")
+        content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        size = os.path.getsize(file_path)
+        if size > 512 * 1024 * 1024:
+            raise XError("File exceeds X's 512 MB media limit.", kind="validation")
+        is_video = content_type.startswith("video/") or content_type == "image/gif"
+        url = "https://upload.twitter.com/i/media/upload2.json" if is_video else "https://upload.twitter.com/i/media/upload.json"
+
+        accounts = await self.x.pool.get_all()
+        acc = next((a for a in accounts if a.active and not a.error_msg), None)
+        if not acc:
+            raise XError("No active accounts.", kind="auth")
+        cookies = _cookies(acc)
+        headers = {
+            "authorization": f"Bearer {BEARER}",
+            "cookie": f"auth_token={cookies.get('auth_token','')}; ct0={cookies.get('ct0','')}",
+            "x-csrf-token": cookies.get("ct0", ""),
+            "x-twitter-active-user": "yes",
+            "x-twitter-auth-type": "OAuth2Session",
+            "origin": "https://x.com",
+            "referer": "https://x.com/compose/post",
+        }
 
         import curl_cffi
         import curl_cffi.requests as curl_requests
 
-        base_headers = {
-            "authorization": f"Bearer {BEARER_TOKEN}",
-            "cookie": cookie_string,
-            "x-csrf-token": csrf,
-            "x-twitter-active-user": "yes",
-            "x-twitter-auth-type": "OAuth2Session",
-            "x-twitter-client-language": "en",
-            "origin": "https://x.com",
-            "referer": "https://x.com/compose/post",
-            "accept": "*/*",
-        }
-
+        session = curl_requests.AsyncSession(impersonate="chrome")
         try:
-            session = curl_requests.AsyncSession(impersonate="chrome")
-
-            # ── Phase 1: INIT ──
-            init_data = {
-                "command": "INIT",
-                "total_bytes": str(file_size),
-                "media_type": content_type,
-            }
-            # For videos, add media_category for proper processing
+            init = {"command": "INIT", "total_bytes": str(size), "media_type": content_type}
             if is_video:
-                init_data["media_category"] = "tweet_video"
-
-            init_resp = await session.post(
-                upload_url,
-                data=init_data,
-                headers={**base_headers, "content-type": "application/x-www-form-urlencoded"},
-            )
-            if init_resp.status_code not in (200, 202):
-                await session.close()
-                return {"error": f"INIT failed (HTTP {init_resp.status_code})", "detail": init_resp.text[:300]}
-
-            media_id = init_resp.json().get("media_id_string")
+                init["media_category"] = "tweet_video" if content_type.startswith("video/") else "tweet_gif"
+            resp = await session.post(url, data=init, headers={**headers, "content-type": "application/x-www-form-urlencoded"})
+            if resp.status_code not in (200, 202):
+                raise XError(f"Media INIT failed (HTTP {resp.status_code})", kind="upstream", hint=resp.text[:200])
+            media_id = (resp.json() or {}).get("media_id_string")
             if not media_id:
-                await session.close()
-                return {"error": "INIT response missing media_id_string", "raw": init_resp.text[:300]}
+                raise XError("Media INIT returned no media id.", kind="upstream", hint=resp.text[:200])
 
-            # ── Phase 2: APPEND (chunked upload) ──
-            CHUNK_SIZE = 4 * 1024 * 1024  # 4MB chunks
-            with open(file_path, "rb") as f:
-                segment = 0
-                while chunk := f.read(CHUNK_SIZE):
-                    append_data = {
-                        "command": "APPEND",
-                        "media_id": media_id,
-                        "segment_index": str(segment),
-                    }
+            chunk_size = 4 * 1024 * 1024
+            with open(file_path, "rb") as fh:
+                index = 0
+                while chunk := fh.read(chunk_size):
                     mp = curl_cffi.CurlMime()
-                    mp.addpart(
-                        name="media",
-                        content_type=content_type,
-                        filename=os.path.basename(file_path),
-                        data=chunk,
-                    )
-                    append_resp = await session.post(
-                        upload_url,
-                        data=append_data,
+                    mp.addpart(name="media", content_type=content_type, filename=os.path.basename(file_path), data=chunk)
+                    r = await session.post(
+                        url,
+                        data={"command": "APPEND", "media_id": media_id, "segment_index": str(index)},
                         multipart=mp,
-                        headers=base_headers,
+                        headers=headers,
                     )
                     mp.close()
-                    if append_resp.status_code not in (200, 204):
-                        await session.close()
-                        return {"error": f"APPEND segment {segment} failed (HTTP {append_resp.status_code})", "detail": append_resp.text[:300]}
-                    segment += 1
+                    if r.status_code not in (200, 204):
+                        raise XError(f"Media APPEND failed at segment {index} (HTTP {r.status_code})", kind="upstream", hint=r.text[:200])
+                    index += 1
 
-            # ── Phase 3: FINALIZE ──
-            finalize_data = {
-                "command": "FINALIZE",
-                "media_id": media_id,
-            }
-            finalize_resp = await session.post(
-                upload_url,
-                data=finalize_data,
-                headers={**base_headers, "content-type": "application/x-www-form-urlencoded"},
+            fin = await session.post(
+                url, data={"command": "FINALIZE", "media_id": media_id}, headers={**headers, "content-type": "application/x-www-form-urlencoded"}
             )
-            if finalize_resp.status_code not in (200, 201, 202):
-                await session.close()
-                return {"error": f"FINALIZE failed (HTTP {finalize_resp.status_code})", "detail": finalize_resp.text[:300]}
+            if fin.status_code not in (200, 201, 202):
+                raise XError(f"Media FINALIZE failed (HTTP {fin.status_code})", kind="upstream", hint=fin.text[:200])
+            info = (fin.json() or {}).get("processing_info") or {}
+            import asyncio
 
-            finalize_result = finalize_resp.json()
-            processing_info = finalize_result.get("processing_info")
-
-            # ── Phase 4: Poll for video processing (if applicable) ──
-            if processing_info and processing_info.get("state") != "succeeded":
-                import asyncio
-                for _ in range(60):  # max 60 polls (5 min for large videos)
-                    await asyncio.sleep(processing_info.get("check_after_secs", 5))
-                    status_resp = await session.get(
-                        f"{upload_url}?command=STATUS&media_id={media_id}",
-                        headers=base_headers,
-                    )
-                    status = status_resp.json().get("processing_info", {})
-                    if status.get("state") == "succeeded":
-                        break
-                    if status.get("state") == "failed":
-                        await session.close()
-                        return {"error": "Media processing failed", "detail": status}
-                    processing_info = status
-
-            await session.close()
-
+            for _ in range(60):
+                if info.get("state") in (None, "succeeded"):
+                    break
+                if info.get("state") == "failed":
+                    raise XError("X failed to process the media.", kind="upstream", hint=json.dumps(info)[:200])
+                await asyncio.sleep(info.get("check_after_secs", 3))
+                status_resp = await session.get(f"{url}?command=STATUS&media_id={media_id}", headers=headers)
+                info = (status_resp.json() or {}).get("processing_info") or {}
             return {
                 "status": "uploaded",
-                "media_id": media_id,
-                "media_id_string": media_id,
+                "media_id": str(media_id),
                 "media_type": "video" if is_video else "image",
-                "usage": f"Pass media_ids=[{media_id}] to post_tweet()",
+                "usage": f'post_tweet(text=..., media_ids="{media_id}")',
             }
-        except Exception as e:
-            return {"error": str(e)}
+        finally:
+            await session.close()
+
+    @safe
+    async def download_media(self, source: str, dest_dir: str = ".") -> dict:
+        """Download a tweet's media (or one media URL) to disk."""
+        os.makedirs(dest_dir, exist_ok=True)
+        urls: list[str] = []
+        if source.startswith("http"):
+            urls = [source]
+        else:
+            tweet = await self.tweet(source)
+            urls = tweet.get("media_urls") or []
+            if not urls:
+                raise XError("That tweet has no media.", kind="not_found")
+        saved = []
+        for url in urls:
+            data = await self.x.get_bytes(url)
+            name = url.split("/")[-1].split("?")[0] or f"media_{int(time.time())}"
+            path = os.path.join(dest_dir, f"{uuid.uuid4().hex[:8]}_{name}")
+            with open(path, "wb") as fh:
+                fh.write(data)
+            saved.append({"path": path, "bytes": len(data), "source_url": url})
+        return {"files": saved, "count": len(saved)}
+
+    # ══════════════════════════════════════════════════════════
+    #  Limits / health
+    # ══════════════════════════════════════════════════════════
+
+    @safe
+    async def rate_limits(self) -> dict:
+        accounts = await self.x.pool.get_all()
+        rows = []
+        for acc in accounts:
+            rows.append(
+                {
+                    "username": acc.username,
+                    "active": bool(acc.active),
+                    "error": acc.error_msg,
+                    "locks": acc.locks if isinstance(acc.locks, dict) else {},
+                    "last_used": iso_time(str(acc.last_used)) if acc.last_used else None,
+                    "last_response_headers": self.x.last_headers.get(acc.username, {}),
+                }
+            )
+        return {"accounts": rows, "count": len(rows)}
+
+
+# ══════════════════════════════════════════════════════════════
+#  Response helpers local to this module
+# ══════════════════════════════════════════════════════════════
+
+
+def _json_or_text(resp) -> Any:
+    try:
+        return resp.json()
+    except ValueError:
+        return resp.text[:300]
+
+
+def _parse_list_timeline(data: Any) -> tuple[list[dict], Optional[str]]:
+    from spectre.parse import _entries  # local import keeps parse.py's surface small
+
+    lists: list[dict] = []
+    cursor = None
+    seen = set()
+    for entry in _entries(data):
+        content = entry.get("content") or {}
+        if content.get("entryType") == "TimelineTimelineCursor":
+            if content.get("cursorType") == "Bottom":
+                cursor = content.get("value")
+            continue
+        item = content.get("itemContent") or {}
+        raw = item.get("list") or item
+        list_id = sid(raw.get("id_str") or raw.get("id") or raw.get("rest_id"))
+        if list_id and list_id not in seen:
+            seen.add(list_id)
+            lists.append(
+                {
+                    "list_id": list_id,
+                    "name": raw.get("name"),
+                    "description": raw.get("description"),
+                    "member_count": raw.get("member_count"),
+                    "subscriber_count": raw.get("subscriber_count"),
+                    "private": raw.get("mode") == "private" or bool(raw.get("is_private")),
+                }
+            )
+    return lists, cursor
+
+
+def _find_folders(data: Any) -> list[dict]:
+    folders: list[dict] = []
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if depth > 12:
+            return
+        if isinstance(node, dict):
+            if node.get("__typename") == "BookmarkCollection" or (
+                "name" in node and ("id" in node or "bookmark_collection_id" in node) and ("visibility" in node or "sort_index" in node)
+            ):
+                fid = sid(node.get("id") or node.get("bookmark_collection_id"))
+                if fid:
+                    folders.append({"folder_id": fid, "name": node.get("name"), "visibility": node.get("visibility")})
+                return
+            for value in node.values():
+                walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+
+    walk(data)
+    return folders
+
+
+def _find_dm_messages(data: Any) -> list[dict]:
+    out: list[dict] = []
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if depth > 14:
+            return
+        if isinstance(node, dict):
+            if "message_data" in node and isinstance(node["message_data"], dict):
+                md = node["message_data"]
+                out.append(
+                    {
+                        "message_id": sid(node.get("id")),
+                        "conversation_id": sid(node.get("conversation_id")),
+                        "text": md.get("text", ""),
+                        "sender_id": sid(md.get("sender_id")),
+                        "recipient_id": sid(md.get("recipient_id")),
+                        "timestamp": iso_time(md.get("time")),
+                    }
+                )
+                return
+            for value in node.values():
+                walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+
+    walk(data)
+    return out
+
+
+def _find_dm_conversations(data: Any) -> list[dict]:
+    out: list[dict] = []
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if depth > 14:
+            return
+        if isinstance(node, dict):
+            if node.get("__typename") == "DmConversation" or ("conversation_id" in node and "participants" in node):
+                out.append(
+                    {
+                        "conversation_id": sid(node.get("conversation_id") or node.get("id")),
+                        "name": (node.get("conversation_name") or ""),
+                        "participants": node.get("participants") or [],
+                    }
+                )
+                return
+            for value in node.values():
+                walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+
+    walk(data)
+    return out
+
+
+def _find_users(data: Any) -> list[dict]:
+    from spectre.parse import _entries
+
+    users: list[dict] = []
+    seen = set()
+    for entry in _entries(data):
+        content = entry.get("content") or {}
+        item = content.get("itemContent") or {}
+        parsed = user_dict((item.get("user_results") or {}).get("result"))
+        if parsed and parsed["id"] not in seen:
+            seen.add(parsed["id"])
+            users.append(parsed)
+    return users
