@@ -4,7 +4,7 @@
     spectre remove <name>                            drop an account
     spectre list                                     list accounts
     spectre status                                   pool health
-    spectre rename <old> <new>                       fix a stale handle
+    spectre rename <old> <new>                       rename a pool account (cookies kept)
     spectre doctor                                   check query ids + auth
     spectre serve                                    start the MCP server (default)
 
@@ -148,7 +148,7 @@ async def _add(raw_name: str, raw_cookies: str) -> int:
 
     print(_ok(f"@{handle} added and verified."))
     if raw_name.lstrip("@").lower() != handle.lower():
-        print(f"   {DIM}Saved under the real handle (@{handle}), not the name you typed.{RESET}")
+        print(f"   {DIM}Saved under the handle (@{handle}).{RESET}")
     print(f"   {DIM}Pool: {len(existing) + (0 if handle.lower() in existing else 1)} account(s) · {_db_path()}{RESET}")
     return 0
 
@@ -252,7 +252,12 @@ async def _doctor() -> int:
             else:
                 print(_ok(f"ops     {result['refreshed']} operations up to date"))
             if result["missing"]:
-                print(_warn(f"ops     {len(result['missing'])} operations not in the upstream bundle"))
+                known = {"useSendMessageMutation"}
+                unexplained = [n for n in result["missing"] if n not in known]
+                if unexplained:
+                    print(_warn(f"ops     {len(unexplained)} operation(s) missing upstream: {', '.join(unexplained[:3])}"))
+                else:
+                    print(f"{DIM}ops     DM send uses a built-in id (not published in X's bundles){RESET}")
         except Exception as exc:  # noqa: BLE001 - offline is not a failure
             print(_warn(f"ops     could not refresh query ids ({type(exc).__name__}); using the built-in table"))
     else:
@@ -264,15 +269,21 @@ async def _doctor() -> int:
     writer = Writer(client)
     scraper = Scraper(pool, default_budget=15)
 
-    me = await writer.me()
-    if not isinstance(me, dict) or me.get("error"):
-        print(_err(f"auth    {(me or {}).get('error', 'no viewer')}"))
+    # Verify every account against its own cookies: comparing them all to one
+    # identity would flag perfectly good secondary accounts as stale.
+    healthy = 0
+    for acc in accounts:
+        identity = await writer.me(account=acc.username)
+        if not isinstance(identity, dict) or identity.get("error"):
+            print(_err(f"auth    @{acc.username}: {identity.get('error') if isinstance(identity, dict) else identity}"))
+            continue
+        healthy += 1
+        print(_ok(f"auth    @{acc.username} ({identity['id']})"))
+        if identity["username"].lower() != acc.username.lower():
+            print(_warn(f"handle  pool says @{acc.username}, X says @{identity['username']} - run: spectre rename {acc.username} {identity['username']}"))
+    if not healthy:
         return 1
-    print(_ok(f"auth    @{me['username']} ({me['id']})"))
-
-    drift = [a.username for a in accounts if a.username.lower() != me["username"].lower()]
-    if drift:
-        print(_warn(f"handle  pool says @{drift[0]}, X says @{me['username']} - run: spectre rename {drift[0]} {me['username']}"))
+    me = await writer.me()
 
     profile = await scraper.user(me["username"])
     if isinstance(profile, dict) and profile.get("error"):

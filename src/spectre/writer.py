@@ -74,9 +74,12 @@ class Writer:
     # ══════════════════════════════════════════════════════════
 
     @safe
-    async def me(self) -> dict:
-        """Who the session actually is, per X (not per the local DB)."""
-        data = await self.x.graphql("Viewer", {})
+    async def me(self, account: Optional[str] = None) -> dict:
+        """Who the session actually is, per X (not per the local DB).
+
+        Pass `account` to ask a specific pool account instead of the preferred one.
+        """
+        data = await self.x.graphql("Viewer", {}, account=account)
         viewer = (data.get("data") or {}).get("viewer") or {}
         user = user_dict((viewer.get("user_results") or {}).get("result"))
         if not user:

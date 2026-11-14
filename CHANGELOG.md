@@ -3,6 +3,24 @@
 All notable changes to `spectre-mcp`. Versioning is semver; the tool surface is
 the public API.
 
+## 2.0.6 — 2026-11-14
+
+- **Multi-account `doctor` was wrong.** It compared every pool account to a
+  single identity, so with two accounts it told you to rename the healthy second
+  one. Each account is now verified with its own cookies.
+- **The shipped query-id table is current.** It was built from the live-probe
+  results rather than X's bundle, so a fresh install immediately "updated" 43
+  ids. `ops.py` is generated from the bundle now: a clean install starts at zero
+  changes, and `tools/update_ops.py --check` fails if it ever drifts.
+- **GraphQL is POST-only.** Some read operations (`SearchTimeline`,
+  `UserTweetsAndReplies`) answer a bare 404 to GET while working over POST; the
+  client no longer has two code paths to get wrong. The 404 ladder is: fresh
+  transaction id, then the built-in id, then an actionable error.
+- `doctor` no longer calls the DM-send operation "missing upstream" — it is not
+  published in X's bundles and has a built-in id.
+- `spectre add` prints `Saved under the handle (@x).`; `spectre rename` says what
+  it does (relabels the pool entry, cookies kept, X untouched).
+
 ## 2.0.5 — 2026-11-14
 
 - **Highlights are back.** `create_highlight` and `delete_highlight` were dropped

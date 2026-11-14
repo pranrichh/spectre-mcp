@@ -77,7 +77,7 @@ class XClient:
 
     # ── account selection ──
 
-    async def _accounts(self) -> list:
+    async def _accounts(self, only: Optional[str] = None) -> list:
         accounts = await self.pool.get_all()
         if not accounts:
             raise XError(
@@ -93,6 +93,12 @@ class XClient:
                 kind="auth",
                 hint='Re-add cookies: spectre add <name> "auth_token=...; ct0=..."',
             )
+
+        if only:
+            match = [a for a in usable if a.username.lower() == only.lstrip("@").lower()]
+            if not match:
+                raise XError(f"@{only} is not an active account in the pool.", kind="validation")
+            return match
 
         def rank(acc) -> tuple[int, str]:
             # preferred first, then least-recently-used (twscrape keeps last_used as str/None)
@@ -170,54 +176,51 @@ class XClient:
             query_id = override
         return f"{GQL}/{query_id}/{name}", {"method": method, "features": features, "toggles": toggles, "query_id": query_id}
 
-    async def graphql(self, name: str, variables: dict[str, Any]) -> dict:
+    async def _send(
+        self,
+        client: httpx.AsyncClient,
+        name: str,
+        query_id: str,
+        features: dict,
+        toggles: list,
+        variables: dict,
+        acc,
+        fresh_tx: bool = False,
+    ) -> httpx.Response:
+        """POST one GraphQL call.
+
+        X answers POST for queries and mutations alike; some read operations
+        (SearchTimeline, UserTweetsAndReplies) return a bare 404 on GET, which is
+        why this client does not bother with GET at all.
+        """
+        body = {
+            "variables": variables,
+            "features": features,
+            "fieldToggles": {t: False for t in toggles},
+            "queryId": query_id,
+        }
+        headers: dict[str, str] = {}
+        tx = await self._txid(acc, fresh=fresh_tx)
+        if tx:
+            headers["x-client-transaction-id"] = tx.calc("POST", f"/i/api/graphql/{query_id}/{name}")
+        return await client.post(f"{GQL}/{query_id}/{name}", json=body, headers=headers)
+
+    async def graphql(self, name: str, variables: dict[str, Any], *, account: Optional[str] = None) -> dict:
         """Call one GraphQL operation, rotating accounts on recoverable failures."""
-        url, spec = self._url(name)
-        accounts = await self._accounts()
+        _, spec = self._url(name)
+        query_id, features, toggles = spec["query_id"], spec["features"], spec["toggles"]
+        accounts = await self._accounts(only=account)
         errors: list[XError] = []
 
-        for attempt, acc in enumerate(accounts):
+        for index, acc in enumerate(accounts):
             client = await self._client(acc)
-            tx = await self._txid(acc)
-            headers = {"x-client-transaction-id": tx.calc(spec["method"].upper(), f"/i/api/graphql/{spec['query_id']}/{name}")} if tx else {}
-
-            body = {
-                "variables": variables,
-                "features": spec["features"],
-                "fieldToggles": {t: False for t in spec["toggles"]},
-            }
-            if spec["method"] == "post":
-                body["queryId"] = spec["query_id"]
-
             try:
-                if spec["method"] == "post":
-                    resp = await client.post(url, json=body, headers=headers)
-                else:
-                    resp = await client.get(
-                        url,
-                        params={
-                            "variables": json.dumps(variables),
-                            "features": json.dumps(spec["features"]),
-                            "fieldToggles": json.dumps(body["fieldToggles"]),
-                        },
-                        headers=headers,
-                    )
+                resp = await self._send(client, name, query_id, features, toggles, variables, acc)
             except httpx.HTTPError:
                 # One quiet retry: these are usually a dropped keep-alive, not an outage.
                 try:
                     await asyncio.sleep(0.4)
-                    if spec["method"] == "post":
-                        resp = await client.post(url, json=body, headers=headers)
-                    else:
-                        resp = await client.get(
-                            url,
-                            params={
-                                "variables": json.dumps(variables),
-                                "features": json.dumps(spec["features"]),
-                                "fieldToggles": json.dumps(body["fieldToggles"]),
-                            },
-                            headers=headers,
-                        )
+                    resp = await self._send(client, name, query_id, features, toggles, variables, acc)
                 except httpx.HTTPError as retry_exc:
                     detail = str(retry_exc) or type(retry_exc).__name__
                     errors.append(XError(f"Network error talking to X: {detail}", kind="network", operation=name, account=acc.username))
@@ -247,63 +250,31 @@ class XClient:
                 )
                 continue
 
-            # A stale query id answers 404 {"message": "Query not found"}. Retry once
-            # with a freshly mined transaction id before blaming the id itself.
             if resp.status_code == 404 and isinstance(data, dict) and "Query not found" in str(data.get("message", "")):
-                tx = await self._txid(acc, fresh=True)
-                if tx:
-                    headers["x-client-transaction-id"] = tx.calc(spec["method"].upper(), f"/i/api/graphql/{spec['query_id']}/{name}")
-                    try:
-                        if spec["method"] == "post":
-                            resp = await client.post(url, json=body, headers=headers)
-                        else:
-                            resp = await client.get(
-                                url,
-                                params={
-                                    "variables": json.dumps(variables),
-                                    "features": json.dumps(spec["features"]),
-                                    "fieldToggles": json.dumps(body["fieldToggles"]),
-                                },
-                                headers=headers,
-                            )
-                        data = resp.json()
-                    except (httpx.HTTPError, ValueError):
-                        pass
+                # Ladder: fresh transaction id -> built-in id -> give up.
+                resp = await self._send(client, name, query_id, features, toggles, variables, acc, fresh_tx=True)
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = {}
                 if resp.status_code == 404 and "Query not found" in str(data.get("message", "")):
-                    # A refreshed table can point at an id X stopped serving; the
-                    # built-in id is a second shot before giving up.
                     builtin = OPS.get(name)
-                    if builtin and builtin[0] != spec["query_id"]:
-                        spec = {"query_id": builtin[0], "features": builtin[2], "toggles": builtin[3], "method": builtin[1]}
-                        url = f"{GQL}/{builtin[0]}/{name}"
-                        body["features"] = builtin[2]
-                        body["fieldToggles"] = {t: False for t in builtin[3]}
-                        body["queryId"] = builtin[0]
-                        logger.warning(f"{name}: refreshed id was rejected, using the built-in id")
-                        if spec["method"] == "post":
-                            resp = await client.post(url, json=body, headers=headers)
-                        else:
-                            resp = await client.get(
-                                url,
-                                params={
-                                    "variables": json.dumps(variables),
-                                    "features": json.dumps(body["features"]),
-                                    "fieldToggles": json.dumps(body["fieldToggles"]),
-                                },
-                                headers=headers,
-                            )
+                    if builtin and builtin[0] != query_id:
+                        logger.warning(f"{name}: refreshed id was rejected, trying the built-in id")
+                        query_id, features, toggles = builtin[0], builtin[2], builtin[3]
+                        resp = await self._send(client, name, query_id, features, toggles, variables, acc)
                         try:
                             data = resp.json()
                         except ValueError:
                             data = {}
-                    if resp.status_code == 404 and "Query not found" in str(data.get("message", "")):
-                        raise XError(
-                            f"X no longer serves the GraphQL operation {name!r}.",
-                            kind="not_found",
-                            status=404,
-                            operation=name,
-                            hint="Run `spectre doctor` to refresh query ids.",
-                        )
+                if resp.status_code == 404 and "Query not found" in str(data.get("message", "")):
+                    raise XError(
+                        f"X no longer serves the GraphQL operation {name!r}.",
+                        kind="not_found",
+                        status=404,
+                        operation=name,
+                        hint="Run `spectre doctor --update` to refresh query ids.",
+                    )
 
             if resp.status_code in (401, 403):
                 await self._park(acc, f"HTTP {resp.status_code}")
@@ -337,7 +308,7 @@ class XClient:
                 if not payload:  # error with no data at all -> real failure
                     if xerr.kind in ("auth", "rate_limit"):
                         await self._park(acc, xerr.message)
-                    if xerr.kind in ("auth", "rate_limit") and attempt + 1 < len(accounts):
+                    if xerr.kind in ("auth", "rate_limit") and index + 1 < len(accounts):
                         errors.append(xerr)
                         continue
                     raise xerr
@@ -358,7 +329,6 @@ class XClient:
                 data.pop("errors", None)
             return data
 
-        # Every account failed: report the most informative error.
         if errors:
             first = next((e for e in errors if e.kind != "rate_limit"), errors[0])
             if all(e.kind == "rate_limit" for e in errors):

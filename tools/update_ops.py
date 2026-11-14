@@ -117,9 +117,22 @@ FALLBACK = {
 }
 
 
-def main():
-    src = sys.argv[1] if len(sys.argv) > 1 else "/tmp/gql.json"
-    dump = json.load(open(src))
+UPSTREAM = "https://raw.githubusercontent.com/fa0311/TwitterInternalAPIDocument/master/docs/json/GraphQL.json"
+
+
+def load_dump(path: str | None):
+    if path:
+        with open(path) as fh:
+            return json.load(fh)
+    import urllib.request
+
+    print(f"fetching {UPSTREAM}")
+    with urllib.request.urlopen(UPSTREAM, timeout=60) as resp:
+        return json.load(resp)
+
+
+def build(dump) -> tuple[list[str], dict[str, dict], list[str]]:
+    """Turn a bundle dump into (ops.py lines, per-op specs, missing names)."""
     bundle = {}
     for item in dump:
         e = item.get("exports", {})
@@ -136,22 +149,16 @@ def main():
 
     resolved = json.load(open(resolved_path)) if os.path.exists(resolved_path) else {}
 
-    # Deduplicate feature sets: X ships 3-4 distinct bundles (timeline, tweet, mutation...)
     sets: dict[str, dict] = {}
     order: list[str] = []
-    for name, method in OPS_USED.items():
+    for name in OPS_USED:
         spec = bundle.get(name)
         feats = spec["features"] if spec else {}
         key = json.dumps(feats, sort_keys=True)
         if key not in sets:
             sets[key] = feats
             order.append(key)
-    set_name = {}
-    for i, key in enumerate(order):
-        if not sets[key]:
-            set_name[key] = None
-            continue
-        set_name[key] = f"FEATURES_{i}"
+    set_name = {k: (None if not sets[k] else f"FEATURES_{i}") for i, k in enumerate(order)}
 
     header = [
         '"""X/Twitter internal GraphQL operations — query IDs, features, field toggles.',
@@ -166,7 +173,7 @@ def main():
         "from __future__ import annotations",
         "",
     ]
-    body = []
+    body: list[str] = []
     for key in order:
         nm = set_name[key]
         if not nm:
@@ -178,14 +185,14 @@ def main():
         body.append("")
     body.append("# name -> (query_id, http_method, features, field_toggles)")
     body.append("OPS: dict[str, tuple[str, str, dict[str, bool], list[str]]] = {")
-    missing = []
+
+    missing: list[str] = []
+    specs: dict[str, dict] = {}
     for name, method in OPS_USED.items():
         spec = bundle.get(name)
-        qid = None
-        if name in resolved and resolved[name].get("chosen"):
+        qid = spec["query_id"] if spec else None
+        if not qid and name in resolved and resolved[name].get("chosen"):
             qid = resolved[name]["chosen"]["qid"]
-        if not qid and spec:
-            qid = spec["query_id"]
         if not qid:
             qid = FALLBACK.get(name)
         if not qid:
@@ -193,14 +200,38 @@ def main():
             continue
         feats = spec["features"] if spec else {}
         toggles = spec["field_toggles"] if spec else []
+        specs[name] = {"query_id": qid, "features": feats, "field_toggles": toggles}
         fname = set_name.get(json.dumps(feats, sort_keys=True)) or "{}"
         body.append(f'    "{name}": ("{qid}", "{method.lower()}", {fname}, {toggles!r}),')
     body.append("}")
     body.append("")
-    lines = header + body
+    return header + body, specs, missing
+
+
+def main():
+    check_only = "--check" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    dump = load_dump(args[0] if args else None)
+    lines, specs, missing = build(dump)
+
     out = os.path.join(REPO, "src", "spectre", "ops.py")
-    open(out, "w").write("\n".join(lines) + "\n")
-    print(f"wrote {out}: {len(OPS_USED) - len(missing)} ops")
+    if check_only:
+        sys.path.insert(0, os.path.join(REPO, "src"))
+        from spectre.ops import OPS
+
+        stale = [n for n, s in specs.items() if n in OPS and OPS[n][0] != s["query_id"]]
+        absent = [n for n in specs if n not in OPS]
+        if stale or absent:
+            print(f"ops.py is stale: {len(stale)} changed, {len(absent)} missing")
+            for n in stale[:10]:
+                print(f"  {n}: {OPS[n][0]} -> {specs[n]['query_id']}")
+            raise SystemExit(1)
+        print(f"ops.py is current ({len(OPS)} operations)")
+        return
+
+    with open(out, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"wrote {out}: {len(specs)} ops")
     if missing:
         print("MISSING (add a FALLBACK id):", missing)
 
