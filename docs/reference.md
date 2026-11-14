@@ -100,7 +100,7 @@ Reads return the same shapes whether the data came from GraphQL or twscrape.
 }
 ```
 
-IDs are strings on the way out too — echo them back as-is.
+IDs are returned as strings; pass them back unchanged.
 
 ## Errors
 

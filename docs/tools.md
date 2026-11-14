@@ -7,11 +7,6 @@ Every tool returns JSON. Failures look like
 Read [safety.md](safety.md) before calling anything in **Composing**, **Engagement**,
 **Social graph**, **Direct messages** or **Lists** — those change state on X.
 
-IDs (`tweet_id`, `user_id`, `list_id`, `community_id`, `reply_to`, `quote_tweet`)
-are strings, or full `https://x.com/...` URLs. Never JSON numbers: X ids exceed
-2^53 and get rounded by JSON parsers.
-
-
 ## Accounts & sessions
 
 Who is logged in, how healthy the pool is, and what to do when a call is rate limited.

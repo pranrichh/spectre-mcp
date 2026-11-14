@@ -4,8 +4,7 @@ Design rules for this layer:
 
 * A tool returns JSON, always. Failures come back as `{"error", "kind", "hint"}`
   so the caller can branch on `kind` instead of parsing prose.
-* Every X id is accepted as a string (or a full x.com URL) because X ids exceed
-  the 2^53 safe-integer range of JSON numbers.
+* X ids are accepted as strings (or full x.com URLs); that is the schema.
 * Docstrings describe *when* to call a tool and what it costs, not its argument
   list — the schema already does arguments.
 """
@@ -29,7 +28,7 @@ INSTRUCTIONS = """Spectre gives you X/Twitter: search, timelines, profiles, post
 media, DMs, lists, bookmarks, notifications, scheduled posts and account management.
 
 Start with get_me() to confirm which account is live, then search()/get_user().
-Ids are strings (or x.com URLs) — never JSON numbers. Read tools are cheap;
+Ids are strings or x.com URLs. Read tools are cheap;
 write tools are public and permanent, so confirm intent with the user first.
 Errors carry `kind`: rate_limit (wait or switch account), auth (re-add cookies),
 permission (X Premium / privacy), validation (fix the input), not_found."""

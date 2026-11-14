@@ -1,8 +1,7 @@
 """Response parsing: X's GraphQL REST JSON -> Spectre's stable output shapes.
 
 Every read tool speaks the same two shapes no matter whether the data came from
-GraphQL, REST v1.1 or twscrape. IDs are always strings — X ids overflow IEEE-754
-doubles, and an agent that echoes a rounded id back gets a "not found".
+GraphQL, REST v1.1 or twscrape. IDs are always strings.
 
 Tweet:
     id, url, text, author_id, author_username, author_name, created_at, lang,

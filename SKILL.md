@@ -53,9 +53,8 @@ many accounts). An empty list with a `note` is an answer; do not loop on it.
 
 ## Non-negotiables
 
-**IDs are strings.** Every id argument accepts a numeric string or an
-`https://x.com/...` URL. Never pass a JSON number — X ids exceed 2^53 and get
-silently rounded into "not found".
+**IDs are strings.** Every id argument takes a numeric string or an
+`https://x.com/...` URL; pass ids back exactly as the tools return them.
 
 **Resolve before you act.** Follow, block, mute, DM and user-likes take
 `user_id`; get it from `get_user` once and keep it. Post operations take
