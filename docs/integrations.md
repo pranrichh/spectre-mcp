@@ -2,45 +2,7 @@
   <img src="../assets/headers/integrations.svg" alt="Integrations" />
 </p>
 
-# Integrations
-
-Spectre is a standard MCP server over stdio. The command is always
-`uvx spectre-mcp` (or `spectre-mcp` if installed system-wide).
-
-## Hermes Agent (recommended)
-
-Spectre was built for [Hermes Agent](https://github.com/NousResearch/hermes-agent),
-and ships a skill that teaches the agent when to reach for which tool.
-
-1. Add the server to `~/.hermes/config.yaml`:
-
-   ```yaml
-   mcp_servers:
-     spectre:
-       command: "uvx"
-       args: ["spectre-mcp"]
-       timeout: 120
-   ```
-
-2. Install the skill (Hermes discovers `~/.hermes/skills/<category>/<name>/SKILL.md`):
-
-   ```bash
-   mkdir -p ~/.hermes/skills/mcp/spectre/references
-   curl -fsSL https://raw.githubusercontent.com/pranrichh/spectre-mcp/main/SKILL.md \
-     -o ~/.hermes/skills/mcp/spectre/SKILL.md
-   curl -fsSL https://raw.githubusercontent.com/pranrichh/spectre-mcp/main/references/full-follower-extraction.md \
-     -o ~/.hermes/skills/mcp/spectre/references/full-follower-extraction.md
-   ```
-
-3. Reload:
-
-   ```
-   /reload-mcp
-   /reload-skills
-   ```
-
-The skill covers which tool fits which job, what each call costs, what must be
-confirmed first, and which failures mean "stop" rather than "retry".
+Spectre is a standard MCP server over stdio. The command is always `uvx spectre-mcp` (or `spectre-mcp` if installed system-wide).
 
 ## Claude Desktop
 
@@ -57,8 +19,6 @@ confirmed first, and which failures mean "stop" rather than "retry".
 }
 ```
 
-Claude reads the tool docstrings directly, so no extra skill file is needed.
-
 ## Cursor / Windsurf / Cline
 
 `.cursor/mcp.json` (or the equivalent config for your client):
@@ -74,6 +34,74 @@ Claude reads the tool docstrings directly, so no extra skill file is needed.
 }
 ```
 
+## OpenCode
+
+`opencode.json` (project root or `~/.config/opencode/opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "spectre": {
+      "type": "local",
+      "command": ["uvx", "spectre-mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+## OMP
+
+`.omp/mcp.json` in the project, or `~/.omp/agent/mcp.json` for every project:
+
+```json
+{
+  "mcpServers": {
+    "spectre": {
+      "command": "uvx",
+      "args": ["spectre-mcp"]
+    }
+  }
+}
+```
+
+Then `/mcp reload` and `/mcp test spectre` inside OMP.
+
+## DeepSeek Harness (DSH)
+
+Add `@deepseek-ai/dsh-mcp-client` as a plugin and register Spectre as a stdio server:
+
+```yaml
+- id: mcp-spectre
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: spectre
+    transport: stdio
+    command: uvx
+    args: ['spectre-mcp']
+```
+
+The server's tools show up as `mcp__spectre__<tool>`.
+
+## Hermes Agent
+
+`~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  spectre:
+    command: "uvx"
+    args: ["spectre-mcp"]
+    timeout: 120
+```
+
+Hermes can also load the [SKILL.md](../SKILL.md) guide, which tells the agent
+which tool fits which job and what needs confirming first. Copy it to
+`~/.hermes/skills/mcp/spectre/SKILL.md` (plus
+[references/full-follower-extraction.md](../references/full-follower-extraction.md)
+in `references/`), then reload with `/reload-mcp` and `/reload-skills`.
+
 ## From Python
 
 ```python
@@ -88,7 +116,7 @@ async with stdio_client(server) as (read, write):
         me = await session.call_tool("get_me", {})
 ```
 
-Or skip MCP and import the writer directly (same code the server runs):
+Or skip MCP and import the writer directly (the same code the server runs):
 
 ```python
 import asyncio
@@ -114,5 +142,4 @@ pipx upgrade spectre-mcp      # pipx
 uv tool upgrade spectre-mcp   # uv
 ```
 
-After upgrading, run `spectre doctor` — it re-checks auth and the GraphQL
-operation table, which is the thing most likely to age.
+After upgrading, run `spectre doctor` to check cookies and connectivity.

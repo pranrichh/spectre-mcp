@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  111 tools · no browser · no API keys · no monthly fees
+  100+ tools · no browser · no API keys · no monthly fees
 </p>
 
 <p align="center">
@@ -24,14 +24,14 @@
   <img src="https://raw.githubusercontent.com/pranrichh/spectre-mcp/main/assets/headers/why.svg" alt="Why Spectre?" />
 </p>
 
-Spectre is an MCP server that gives AI agents 111 tools for X/Twitter — from search and posting to DMs, lists, and communities. Under the hood, it talks directly to X's internal GraphQL and REST APIs. No browser to spin up, no Puppeteer to maintain, no DOM scraping that breaks on UI changes.
+Spectre is an MCP server that gives AI agents 100+ tools for X/Twitter — from search and posting to DMs, lists, and communities. Under the hood, it talks directly to X's internal GraphQL and REST APIs. No browser to spin up, no Puppeteer to maintain, no DOM scraping that breaks on UI changes.
 
 | | **Spectre** | **XActions** | **twikit** |
 |--|:-:|:-:|:-:|
 | **Architecture** | Direct GraphQL/REST | Puppeteer (headless browser) | Python API wrapper |
 | **Speed** | <1s per request | 3–10s (browser startup) | ~1s per request |
 | **Memory** | ~10 MB | ~200 MB+ (Chromium) | ~10 MB |
-| **MCP Server** | ✓ 111 tools | ~50 API tools | ✗ None |
+| **MCP Server** | ✓ 100+ tools | ~50 API tools | ✗ None |
 | **Account Pool** | ✓ Multi-account rotation | ✗ Single auth_token | ✗ Single session |
 | **Browser Required** | ✗ Never | ✓ Always | ✗ Never |
 | **DOM Breakage Risk** | ✗ None | ~ breaks on UI changes | ✗ None |
@@ -92,7 +92,7 @@ spectre doctor    # auth + connectivity check
 
 ### 3. Configure Your MCP Client
 
-Add to your MCP client config (`~/.hermes/config.yaml`, `claude_desktop_config.json`, `.cursor/mcp.json`, or equivalent):
+Add to your MCP client config (`claude_desktop_config.json`, `.cursor/mcp.json`, `opencode.json`, or equivalent):
 
 ```json
 {
@@ -105,7 +105,7 @@ Add to your MCP client config (`~/.hermes/config.yaml`, `claude_desktop_config.j
 }
 ```
 
-For client-specific setup (Hermes skill, Claude, Cursor, Python), see [Integrations](docs/integrations.md).
+For client-specific setup (Claude, Cursor, OpenCode, OMP, DeepSeek Harness, Python), see [Integrations](docs/integrations.md).
 
 > **No `uv`?** Install it: `curl -LsSf https://astral.sh/uv/install.sh | sh`
 > Or use `python3 -m spectre.server` to run from a local clone.
@@ -141,8 +141,8 @@ Full list with arguments and gotchas: **[docs/tools.md](docs/tools.md)**.
   <img src="https://raw.githubusercontent.com/pranrichh/spectre-mcp/main/assets/headers/reference.svg" alt="Reference" />
 </p>
 
-- [All 111 Tools](docs/tools.md) — every tool, grouped by feature
-- [Integrations](docs/integrations.md) — Hermes, Claude, Cursor, Python
+- [All tools](docs/tools.md) — every tool, grouped by feature
+- [Integrations](docs/integrations.md) — Claude, Cursor, OpenCode, OMP, DeepSeek Harness, Python
 - [Safety](docs/safety.md) — what to confirm before writing, and rate limits
 - [Reference](docs/reference.md) — X query operators, CLI, env vars, output shapes, limitations
 - [Changelog](CHANGELOG.md) — what changed between versions
