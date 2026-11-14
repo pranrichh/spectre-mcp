@@ -2,8 +2,6 @@
   <img src="../assets/headers/reference.svg" alt="Reference" />
 </p>
 
-# Reference
-
 ## X query operators
 
 `search()` passes your query straight to X, so the whole operator language works:
@@ -31,14 +29,17 @@ spectre remove <name>                            drop an account
 spectre list                                     accounts and state
 spectre status                                   pool health (exit 1 if none active)
 spectre rename <old> <new>                       fix a handle after a rename, keep cookies
-spectre doctor                                   auth + connectivity check
+spectre doctor [--no-update]                     auth check + refresh X's GraphQL query ids
 spectre serve                                    start the MCP server (default)
 spectre --version
 ```
 
 `add` verifies the cookies with X before saving them and keeps the account's real
-handle, so a renamed account keeps working. `doctor` is the first thing to run
-when something looks wrong:
+handle, so a renamed account keeps working.
+
+`doctor` is the first thing to run when something looks wrong. It also pulls the
+current GraphQL query ids from X's live bundles and stores them in
+`~/.spectre/ops.json`, so a rotation upstream does not need a release:
 
 ```text
 spectre doctor  v2.0.4
@@ -48,7 +49,7 @@ pool    1 account(s): @handle
 ✓ profile ok
 ✓ timeline ok
 ✓ search  ok
-ops     90 operations loaded - override any with SPECTRE_OP_<NAME>
+✓ ops     90 operations checked, 2 ids updated
 ✓ done
 ```
 
@@ -59,6 +60,7 @@ ops     90 operations loaded - override any with SPECTRE_OP_<NAME>
 | `SPECTRE_DB` | `~/.spectre/accounts.db` | Account pool database |
 | `SPECTRE_PROXY` | none | Global proxy (`http://user:pass@host:port`) |
 | `SPECTRE_OP_<NAME>` | built-in | Override one GraphQL query id, e.g. `SPECTRE_OP_CREATETWEET` |
+| `SPECTRE_OPS_FILE` | `~/.spectre/ops.json` | Where the refreshed query ids are cached |
 | `SPECTRE_LOG_LEVEL` | `ERROR` | `DEBUG` for request logs, `OFF` for silence |
 | `TWS_HTTP_BACKEND` | `httpx` | `curl_cffi` for TLS fingerprinting on reads |
 | `TWS_TELEMETRY` | `0` | Disabled by default |

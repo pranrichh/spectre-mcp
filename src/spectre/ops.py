@@ -1,10 +1,10 @@
 """X/Twitter internal GraphQL operations — query IDs, features, field toggles.
 
-GENERATED FILE. Do not edit by hand; run `python tools/update_ops.py GraphQL.json`.
+GENERATED FILE. Do not edit by hand; refresh it with `spectre doctor --update`.
 
 Source: fa0311/TwitterInternalAPIDocument (GraphQL.json), extracted from X's live
 JS bundles, then verified against api.x.com. Query IDs rotate every few weeks;
-the server re-checks them at runtime and SPECTRE_OP_<NAME> overrides any entry.
+`spectre doctor --update` refreshes them, and SPECTRE_OP_<NAME> overrides one entry.
 """
 
 from __future__ import annotations

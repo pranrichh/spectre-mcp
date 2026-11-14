@@ -22,6 +22,7 @@ from loguru import logger
 
 from spectre.errors import XError, from_x_error, rate_limit_error
 from spectre.ops import OPS
+from spectre.opsync import apply_overrides
 
 # X's public web bearer token — embedded in every browser session, not a secret.
 BEARER = (
@@ -52,6 +53,7 @@ class XClient:
     def __init__(self, pool, proxy: Optional[str] = None):
         self.pool = pool
         self.proxy = proxy
+        self.ops = apply_overrides()
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._preferred: Optional[str] = None
         self._auto_rotate = True
@@ -61,6 +63,10 @@ class XClient:
 
     def set_preferred_account(self, username: Optional[str]) -> None:
         self._preferred = username
+
+    def reload_ops(self) -> None:
+        """Pick up a refreshed query-id table without restarting."""
+        self.ops = apply_overrides()
 
     def set_auto_rotate(self, enabled: bool) -> None:
         self._auto_rotate = enabled
@@ -151,7 +157,7 @@ class XClient:
     # ── core request ──
 
     def _url(self, name: str) -> tuple[str, dict]:
-        spec = OPS.get(name)
+        spec = self.ops.get(name)
         if not spec:
             raise XError(
                 f"Unknown GraphQL operation {name!r}.",
@@ -264,13 +270,40 @@ class XClient:
                     except (httpx.HTTPError, ValueError):
                         pass
                 if resp.status_code == 404 and "Query not found" in str(data.get("message", "")):
-                    raise XError(
-                        f"X no longer serves the GraphQL operation {name!r}.",
-                        kind="not_found",
-                        status=404,
-                        operation=name,
-                        hint="Run `spectre doctor` to refresh query ids.",
-                    )
+                    # A refreshed table can point at an id X stopped serving; the
+                    # built-in id is a second shot before giving up.
+                    builtin = OPS.get(name)
+                    if builtin and builtin[0] != spec["query_id"]:
+                        spec = {"query_id": builtin[0], "features": builtin[2], "toggles": builtin[3], "method": builtin[1]}
+                        url = f"{GQL}/{builtin[0]}/{name}"
+                        body["features"] = builtin[2]
+                        body["fieldToggles"] = {t: False for t in builtin[3]}
+                        body["queryId"] = builtin[0]
+                        logger.warning(f"{name}: refreshed id was rejected, using the built-in id")
+                        if spec["method"] == "post":
+                            resp = await client.post(url, json=body, headers=headers)
+                        else:
+                            resp = await client.get(
+                                url,
+                                params={
+                                    "variables": json.dumps(variables),
+                                    "features": json.dumps(body["features"]),
+                                    "fieldToggles": json.dumps(body["fieldToggles"]),
+                                },
+                                headers=headers,
+                            )
+                        try:
+                            data = resp.json()
+                        except ValueError:
+                            data = {}
+                    if resp.status_code == 404 and "Query not found" in str(data.get("message", "")):
+                        raise XError(
+                            f"X no longer serves the GraphQL operation {name!r}.",
+                            kind="not_found",
+                            status=404,
+                            operation=name,
+                            hint="Run `spectre doctor` to refresh query ids.",
+                        )
 
             if resp.status_code in (401, 403):
                 await self._park(acc, f"HTTP {resp.status_code}")

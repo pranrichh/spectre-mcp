@@ -98,8 +98,9 @@ Errors come back as `{"error", "kind", "hint"}`. Branch on `kind`:
   blocked). Not fixable by retrying; report it.
 - `validation` → the argument is wrong: bad id, bad datetime, tweet too long
   (280 standard / 25,000 Premium), duplicate text, bio containing `< > &`.
-- `not_found` → the post/user is gone. If *every* read fails this way, the
-  query ids have rotated: `spectre doctor`.
+- `not_found` → the post/user is gone. If *every* read fails this way, either
+  the cookies are stale or the query ids rotated: run `spectre doctor`, which
+  re-checks the account and pulls the current query ids from X's bundles.
 - `upstream` → X returned something unusable. One retry, then report.
 
 Never convert an error into a success story in your summary. "Posted" means
@@ -142,7 +143,7 @@ Spectre's own environment.
 ## Things that bite
 
 - **Cookies expire ~2 weeks.** First symptom is empty searches, not an error.
-  `spectre doctor` proves it.
+  `spectre doctor` proves it, and refreshes the GraphQL query ids while it runs.
 - **`ct0` must be 160 hex chars.** Partial cookies look fine and fail silently.
 - **Stored handles go stale.** If the account was renamed, `get_me` shows the
   real handle and `get_account_settings` flags `pool_username_stale`; fix with

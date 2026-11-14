@@ -5,13 +5,18 @@ the public API.
 
 ## 2.0.4 — 2026-11-14
 
-Documentation tone pass. No code changes.
+`spectre doctor` keeps the query-id table current, plus a documentation pass.
 
-- `docs/safety.md` rewritten: the write tiers, the read-only set, rate limits and
-  scope, without the justification paragraphs.
-- `docs/tools.md` opens with the Tools banner instead of a heading, and the tool
-  docstrings state what a tool does without editorialising about X.
-- README tools table in one consistent shape (`Area | Tools | What they cover`).
+- **`spectre doctor` refreshes X's GraphQL query ids.** It pulls the current
+  bundle map, writes `~/.spectre/ops.json`, and every later process uses it — no
+  release needed when X rotates ids. `--no-update` skips the fetch.
+- If a refreshed id is rejected with "Query not found", the client retries with
+  the built-in id instead of failing.
+- README reads "100+ tools"; the tools table has one consistent shape.
+- `docs/tools.md` opens with the Tools banner; `docs/integrations.md` covers
+  OpenCode, OMP and DeepSeek Harness; Hermes is one client among others.
+- `docs/safety.md` and the tool docstrings state what things do without the
+  justification paragraphs.
 
 ## 2.0.3 — 2026-11-14
 

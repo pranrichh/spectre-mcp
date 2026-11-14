@@ -228,7 +228,7 @@ async def _doctor() -> int:
     """Check auth, the read paths and the operation table this build depends on."""
     from twscrape.accounts_pool import AccountsPool
 
-    from spectre.ops import OPS
+    from spectre import opsync
     from spectre.scraper import Scraper
     from spectre.writer import Writer
     from spectre.xclient import XClient
@@ -242,6 +242,23 @@ async def _doctor() -> int:
         print(_err('no accounts - run: spectre add <name> "auth_token=...; ct0=..."'))
         return 1
     print(f"{DIM}pool    {len(accounts)} account(s): {', '.join('@' + a.username for a in accounts)}{RESET}")
+
+    # Refresh X's GraphQL query ids before testing anything that depends on them.
+    if "--no-update" not in sys.argv:
+        try:
+            result = await opsync.update()
+            if result["changed"]:
+                print(_ok(f"ops     {result['refreshed']} operations checked, {len(result['changed'])} ids updated"))
+            else:
+                print(_ok(f"ops     {result['refreshed']} operations up to date"))
+            if result["missing"]:
+                print(_warn(f"ops     {len(result['missing'])} operations not in the upstream bundle"))
+        except Exception as exc:  # noqa: BLE001 - offline is not a failure
+            print(_warn(f"ops     could not refresh query ids ({type(exc).__name__}); using the built-in table"))
+    else:
+        saved = opsync.status()
+        detail = f" (refreshed {saved['generated_at']})" if saved and saved.get("generated_at") else ""
+        print(_ok(f"ops     built-in table{detail}"))
 
     client = XClient(pool, proxy=os.environ.get("SPECTRE_PROXY"))
     writer = Writer(client)
@@ -277,7 +294,7 @@ async def _doctor() -> int:
     except Exception as exc:  # noqa: BLE001 - doctor reports, never raises
         print(_warn(f"search  {exc}"))
 
-    print(f"{DIM}ops     {len(OPS)} operations loaded - override any with SPECTRE_OP_<NAME>{RESET}")
+    print(f"{DIM}ops     {len(client.ops)} operations loaded - override any with SPECTRE_OP_<NAME>{RESET}")
     await client.aclose()
     print(_ok("done"))
     return 0
