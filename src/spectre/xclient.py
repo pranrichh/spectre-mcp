@@ -4,9 +4,9 @@ One place that knows how to: pick an account, build cookie/header state, mint
 `x-client-transaction-id`, retry a stale query id, fail over to another account
 on a rate limit or dead cookie, and turn every failure into an `XError`.
 
-Accounts are tried in this order: explicitly preferred -> least recently used.
-A 429 or an auth error parks that account (twscrape's own lock table) and moves
-to the next one, so "automatic rotation" is real rather than advertised.
+Accounts are tried in this order: preferred, then least recently used. A 429 or
+an auth error parks that account (twscrape's lock table) and the call moves to
+the next one.
 """
 
 from __future__ import annotations

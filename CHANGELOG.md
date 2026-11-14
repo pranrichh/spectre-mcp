@@ -3,6 +3,16 @@
 All notable changes to `spectre-mcp`. Versioning is semver; the tool surface is
 the public API.
 
+## 2.0.4 — 2026-11-14
+
+Documentation tone pass. No code changes.
+
+- `docs/safety.md` rewritten: the write tiers, the read-only set, rate limits and
+  scope, without the justification paragraphs.
+- `docs/tools.md` opens with the Tools banner instead of a heading, and the tool
+  docstrings state what a tool does without editorialising about X.
+- README tools table in one consistent shape (`Area | Tools | What they cover`).
+
 ## 2.0.3 — 2026-11-14
 
 README: the tools table now uses one consistent shape — `Area | Tools | What

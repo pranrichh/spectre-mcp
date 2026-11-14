@@ -392,8 +392,7 @@ async def _followers_you_know(user_id: str, limit: int) -> dict:
 async def get_user_likes(user_id: XId, limit: int = 20) -> str:
     """Posts a user liked.
 
-    Usually empty: X hides likes for most accounts. If it returns 0, that is X's
-    privacy setting, not a bug — say so instead of retrying.
+    Usually empty: X hides likes for most accounts.
     """
     limit = _clamp(limit, 1, 100)
     data = await _get_client().graphql("Likes", {"userId": str(user_id), "count": limit, "includePromotedContent": False})
@@ -526,8 +525,7 @@ async def get_community_notes(tweet_id: XId) -> str:
 async def rate_community_note(note_id: str, rating: str) -> str:
     """Rate a Community Note: helpful, somewhat_helpful, or not_helpful.
 
-    Requires an account enrolled in Community Notes; others get `kind:
-    permission`, which is X's rule, not a bug.
+    Requires an account enrolled in Community Notes.
     """
     return await _out(_get_writer().rate_community_note(note_id, rating))
 
@@ -1015,8 +1013,7 @@ async def clear_all_bookmarks() -> str:
 async def get_bookmark_folders() -> str:
     """List your bookmark folders.
 
-    Empty on accounts without bookmark-collection access: X gates folders behind
-    Premium and answers `kind: permission` for everyone else.
+    X gates bookmark folders behind Premium.
     """
     return await _out(_get_writer().bookmark_folders())
 

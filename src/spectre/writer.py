@@ -227,7 +227,7 @@ class Writer:
         _, users, next_cursor = timeline(data)
         result = {"users": users, "count": len(users), "next_cursor": next_cursor}
         if not users:
-            result["note"] = "X did not return a likers list for this post (restricted on most accounts, not a Spectre failure)."
+            result["note"] = "X did not return a likers list for this post."
         return result
 
     @safe
@@ -321,8 +321,8 @@ class Writer:
         data = await self.x.graphql("DeleteTweet", {"tweet_id": str(tweet_id)})
         if not (data.get("data") or {}).get("delete_tweet"):
             raise XError(f"X did not accept the delete for {tweet_id}.", kind="upstream")
-        # X answers `{"tweet_results": {}}` whether or not the post existed, so the
-        # only honest confirmation is that the post can no longer be fetched.
+        # X answers `{"tweet_results": {}}` whether or not the post existed, so
+        # confirm by fetching it: gone means deleted.
         import asyncio as _asyncio
 
         # Check with the direct lookup only: TweetDetail keeps serving the

@@ -197,7 +197,9 @@ SECTIONS: list[tuple[str, str, list[str]]] = [
     ),
 ]
 
-HEADER = """# Spectre tool reference
+HEADER = """<p align="center">
+  <img src="../assets/headers/tools.svg" alt="Tools" />
+</p>
 
 {count} tools, generated from the live registry (`tools/gen_docs.py`).
 Every tool returns JSON. Failures look like

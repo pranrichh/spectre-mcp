@@ -41,7 +41,7 @@ handle, so a renamed account keeps working. `doctor` is the first thing to run
 when something looks wrong:
 
 ```text
-spectre doctor  v2.0.3
+spectre doctor  v2.0.4
 db      /home/you/.spectre/accounts.db
 pool    1 account(s): @handle
 ✓ auth    @handle (1234567890)

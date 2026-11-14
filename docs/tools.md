@@ -1,4 +1,6 @@
-# Spectre tool reference
+<p align="center">
+  <img src="../assets/headers/tools.svg" alt="Tools" />
+</p>
 
 111 tools, generated from the live registry (`tools/gen_docs.py`).
 Every tool returns JSON. Failures look like
@@ -141,7 +143,7 @@ Best first move before cold outreach: the overlap is the warm-intro list.
 
 Posts a user liked.
 
-Usually empty: X hides likes for most accounts. If it returns 0, that is X's privacy setting, not a bug — say so instead of retrying.
+Usually empty: X hides likes for most accounts.
 
 ### `get_user_highlights(user_id, limit?)`
 
@@ -215,7 +217,7 @@ Community Notes attached to a post.
 
 Rate a Community Note: helpful, somewhat_helpful, or not_helpful.
 
-Requires an account enrolled in Community Notes; others get `kind: permission`, which is X's rule, not a bug.
+Requires an account enrolled in Community Notes.
 
 ---
 
@@ -541,7 +543,7 @@ Delete every bookmark. Irreversible — confirm first.
 
 List your bookmark folders.
 
-Empty on accounts without bookmark-collection access: X gates folders behind Premium and answers `kind: permission` for everyone else.
+X gates bookmark folders behind Premium.
 
 ### `create_bookmark_folder(name)`
 
