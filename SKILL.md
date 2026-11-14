@@ -146,9 +146,9 @@ between calls.
 - **Cookies expire ~2 weeks.** First symptom is empty searches, not an error.
   `spectre doctor` proves it, and refreshes the GraphQL query ids while it runs.
 - **`ct0` must be 160 hex chars.** Partial cookies look fine and fail silently.
-- **Stored handles go stale.** If the account was renamed, `get_me` shows the
-  real handle and `get_account_settings` flags `pool_username_stale`; fix with
-  `spectre rename <old> <new>`.
+- **Pool labels are local.** An account is stored under whatever label it was
+  added with; `spectre rename <old> <new>` changes only that label. Tools act
+  with the account's cookies, so a label never has to match the X handle.
 - **Delete verification is real.** `delete_tweet` reads the post back; a
   "still readable" error means it was not yours to delete.
 - **DM history is partial by design.** X serves the cookie session a window of

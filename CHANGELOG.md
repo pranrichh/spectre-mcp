@@ -18,8 +18,11 @@ the public API.
   transaction id, then the built-in id, then an actionable error.
 - `doctor` no longer calls the DM-send operation "missing upstream" — it is not
   published in X's bundles and has a built-in id.
-- `spectre add` prints `Saved under the handle (@x).`; `spectre rename` says what
-  it does (relabels the pool entry, cookies kept, X untouched).
+- `spectre add` prints `Saved under the handle (@x).`
+- **Pool labels are local.** `spectre rename` updates the label in place (stats
+  and cookies kept) and never touches X. `doctor` prints `@label (id) -> @handle
+  on X` when they differ instead of suggesting a rename — a label does not have
+  to match the account's handle.
 
 ## 2.0.5 — 2026-11-14
 

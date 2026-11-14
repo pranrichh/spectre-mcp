@@ -126,8 +126,7 @@ class Writer:
             pass
         return {
             **me,
-            "pool_username": pool_user,
-            "pool_username_stale": bool(pool_user and pool_user.lower() != me["username"].lower()),
+            "pool_label": pool_user,
             "note": "X removed the REST /account/settings.json endpoint; these are the fields Viewer exposes.",
         }
 

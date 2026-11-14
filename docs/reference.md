@@ -28,7 +28,7 @@ spectre add <name> "<auth_token=...; ct0=...>"   verify + add an account
 spectre remove <name>                            drop an account
 spectre list                                     accounts and state
 spectre status                                   pool health (exit 1 if none active)
-spectre rename <old> <new>                       rename a pool account (local only, cookies kept)
+spectre rename <old> <new>                       change an account's local label
 spectre doctor [--no-update]                     auth check + refresh X's GraphQL query ids
 spectre serve                                    start the MCP server (default)
 spectre --version
@@ -46,7 +46,7 @@ spectre doctor  v2.0.6
 db      /home/you/.spectre/accounts.db
 pool    1 account(s): @handle
 ✓ ops     89 operations up to date
-✓ auth    @handle (1234567890)
+✓ auth    @label (1234567890)
 ✓ profile ok
 ✓ timeline ok
 ✓ search  ok
@@ -55,7 +55,9 @@ ops     90 operations loaded - override any with SPECTRE_OP_<NAME>
 ```
 
 With more than one account, each one is checked against its own cookies, so a
-second account is never mistaken for a renamed first one.
+second account is never mistaken for a renamed first one. When the local label
+differs from the X handle it prints `@label (id) -> @handle on X`; that is only
+a label, nothing to fix.
 
 ## Environment variables
 

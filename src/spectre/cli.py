@@ -4,13 +4,9 @@
     spectre remove <name>                            drop an account
     spectre list                                     list accounts
     spectre status                                   pool health
-    spectre rename <old> <new>                       rename a pool account (cookies kept)
+    spectre rename <old> <new>                       change an account's local label
     spectre doctor                                   check query ids + auth
     spectre serve                                    start the MCP server (default)
-
-`add` talks to X to prove the cookies work and to store the account's *real*
-handle. The name you type is only a label: if the account was renamed, storing
-the typed name would make every later profile lookup return "not found".
 """
 
 from __future__ import annotations
@@ -18,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 
 from spectre import __version__
@@ -170,20 +167,30 @@ async def _remove(username: str) -> int:
 
 
 async def _rename(old: str, new: str) -> int:
+    """Change the label the pool uses for an account. Local only."""
     from twscrape.accounts_pool import AccountsPool
 
     pool = AccountsPool(_db_path())
     accounts = await pool.get_all()
     old = old.lstrip("@")
-    if not any(a.username.lower() == old.lower() for a in accounts):
+    match = next((a for a in accounts if a.username.lower() == old.lower()), None)
+    if not match:
         print(_err(f"@{old} is not in the pool."))
         return 1
     new = new.lstrip("@")
-    await pool.delete_accounts([old])
-    account = next(a for a in accounts if a.username.lower() == old.lower())
-    cookies = account.cookies if isinstance(account.cookies, str) else "; ".join(f"{k}={v}" for k, v in account.cookies.items())
-    await pool.add_account_cookies(new, cookies)
-    print(_ok(f"@{old} renamed to @{new} (cookies kept)."))
+    if any(a.username.lower() == new.lower() for a in accounts):
+        print(_err(f"@{new} is already in the pool."))
+        return 1
+    try:
+        conn = sqlite3.connect(_db_path())
+        conn.execute("UPDATE accounts SET username = ? WHERE username = ?", (new, match.username))
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as exc:
+        print(_err(f"Could not rename @{match.username}: {exc}"))
+        return 1
+    print(_ok(f"@{match.username} is now labelled @{new}."))
+    print(f"   {DIM}Local label only — the X account and its cookies are untouched.{RESET}")
     return 0
 
 
@@ -278,9 +285,11 @@ async def _doctor() -> int:
             print(_err(f"auth    @{acc.username}: {identity.get('error') if isinstance(identity, dict) else identity}"))
             continue
         healthy += 1
-        print(_ok(f"auth    @{acc.username} ({identity['id']})"))
-        if identity["username"].lower() != acc.username.lower():
-            print(_warn(f"handle  pool says @{acc.username}, X says @{identity['username']} - run: spectre rename {acc.username} {identity['username']}"))
+        if identity["username"].lower() == acc.username.lower():
+            print(_ok(f"auth    @{acc.username} ({identity['id']})"))
+        else:
+            # The pool label is local; a difference is fine and nothing to fix.
+            print(_ok(f"auth    @{acc.username} ({identity['id']}) -> @{identity['username']} on X"))
     if not healthy:
         return 1
     me = await writer.me()
