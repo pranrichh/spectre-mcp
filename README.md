@@ -118,20 +118,20 @@ For client-specific setup (Hermes skill, Claude, Cursor, Python), see [Integrati
 
 ## What You Get
 
-| Area | What it covers |
-|--|--|
-| **Search** | `search` with full operator syntax (`from:`, `since:`, `filter:media`, `min_faves:`…), `search_users` |
-| **Profiles** | `get_user`, `get_user_by_id`, `get_users_by_ids`, timelines, media, followers/following up to 5,000, verified followers, mutuals, likes, highlights |
-| **Posts** | `get_tweet`, `get_tweets` (batch), replies, `get_thread`, `get_tweet_quotes`, retweeters, favoriters, edit history, similar posts, community notes |
-| **Compose** | `post_tweet` (text/reply/quote/media), `upload_media`, `download_media`, scheduled posts, drafts |
-| **Engagement** | like, retweet, bookmark, pin, pin reply — each with its undo |
-| **Social** | follow, mute, block, remove follower, muted/blocked lists |
-| **DMs** | inbox, conversation history, send, search (all/groups/people), muted threads, DM block |
-| **Lists** | create, edit, delete, members, subscribers, subscribe, list timeline, memberships, ownerships |
-| **Communities** | info, posts, join, leave |
-| **Topics & trends** | topic info/follow, trends by location, `get_trend_locations` for woeids |
-| **Bookmarks** | list, search, folders, folder timeline |
-| **Account** | `get_me`, settings, profile edits, avatar, banner, pool management, `get_rate_limits` |
+| Area | Tools | What they cover |
+|--|--|--|
+| **Search** | `search`, `search_users` | full operator syntax: `from:`, `since:`, `filter:media`, `min_faves:`, `lang:` |
+| **Profiles** | `get_user`, `get_user_by_id`, `get_users_by_ids`, `get_user_tweets`, `get_followers`, `get_following` | timelines, media, up to 5,000 followers/following, verified followers, mutuals, likes, highlights |
+| **Posts** | `get_tweet`, `get_tweets`, `get_thread`, `get_tweet_quotes`, `get_tweet_replies` | batch fetch, quote timelines, retweeters, favoriters, edit history, similar posts, community notes |
+| **Compose** | `post_tweet`, `upload_media`, `download_media`, `schedule_tweet`, `create_draft` | text, replies, quotes, media, scheduling, drafts |
+| **Engagement** | `like_tweet`, `retweet`, `bookmark_tweet`, `pin_tweet`, `pin_reply` | each one has its undo |
+| **Social** | `follow_user`, `unfollow_user`, `mute_user`, `block_user`, `remove_follower` | plus muted and blocked lists |
+| **DMs** | `send_dm`, `get_dm_inbox`, `get_dm_conversation`, `search_dm` | search across all / groups / people, muted threads, DM block |
+| **Lists** | `create_list`, `update_list`, `add_list_member`, `get_list_timeline`, `subscribe_list` | members, subscribers, memberships, ownerships |
+| **Communities** | `get_community_info`, `get_community_tweets`, `join_community`, `leave_community` | info, posts, join, leave |
+| **Topics & trends** | `get_topic_info`, `follow_topic`, `get_trends`, `get_trend_locations` | topics, trends by location, woeid lookup |
+| **Bookmarks** | `get_bookmarks`, `search_bookmarks`, `get_bookmark_folders`, `get_bookmark_folder_timeline` | list, search, folders, folder timeline |
+| **Account** | `get_me`, `get_account_settings`, `update_profile`, `get_rate_limits` | settings, profile edits, avatar, banner, pool management |
 
 Full list with arguments and gotchas: **[docs/tools.md](docs/tools.md)**.
 

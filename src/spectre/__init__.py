@@ -4,7 +4,7 @@ from spectre.logsetup import configure as _configure_logging
 
 _configure_logging()
 
-__version__ = "2.0.2"
+__version__ = "2.0.3"
 
 
 def __getattr__(name):

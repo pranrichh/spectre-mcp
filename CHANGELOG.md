@@ -3,6 +3,11 @@
 All notable changes to `spectre-mcp`. Versioning is semver; the tool surface is
 the public API.
 
+## 2.0.3 — 2026-11-14
+
+README: the tools table now uses one consistent shape — `Area | Tools | What
+they cover`, with the call names in backticks on every row. No code changes.
+
 ## 2.0.2 — 2026-11-14
 
 README: drop the "Call a tool" step from the quick start. IDs-as-strings is
