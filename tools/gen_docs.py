@@ -201,7 +201,7 @@ HEADER = """<p align="center">
   <img src="../assets/headers/tools.svg" alt="Tools" />
 </p>
 
-{count} tools, generated from the live registry (`tools/gen_docs.py`).
+{count} tools, generated from the live registry.
 Every tool returns JSON. Failures look like
 `{{"error": "...", "kind": "auth|rate_limit|permission|validation|not_found|upstream", "hint": "..."}}`.
 
