@@ -157,8 +157,8 @@ Spectre's own environment.
   `note`, not a bug.
 - **`get_trends` needs a woeid**, not a country name. Look it up with
   `get_trend_locations`.
-- **The tool count changes with releases.** Do not hardcode "104 tools" in
-  answers; the registry is the truth.
+- **The tool count changes with releases.** Do not hardcode a count in answers;
+  the registry is the truth.
 
 ## Safety line
 
