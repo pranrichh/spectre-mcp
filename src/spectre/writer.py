@@ -1081,6 +1081,12 @@ class Writer:
                 client.headers["content-type"] = original
             if resp.status_code not in (200, 201):
                 payload = _json_or_text(resp)
+                if isinstance(payload, dict) and "user validation" in str(payload.get("error", "")).lower():
+                    raise XError(
+                        f"X refused the {field} change (user validation).",
+                        kind="rate_limit",
+                        hint="X limits how often a profile image can be changed. Try again later.",
+                    )
                 raise XError(
                     f"HTTP {resp.status_code} updating profile {field}",
                     kind="upstream",

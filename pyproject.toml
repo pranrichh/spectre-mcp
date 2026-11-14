@@ -55,7 +55,6 @@ include = [
     "tests",
     "tools",
     "docs",
-    "references",
     "README.md",
     "CHANGELOG.md",
     "SKILL.md",

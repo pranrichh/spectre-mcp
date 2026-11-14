@@ -2,8 +2,6 @@
   <img src="../assets/headers/safety.svg" alt="Safety" />
 </p>
 
-# Safety
-
 Spectre acts as you on X: a wrong call is a public post, a DM to a stranger, or a deleted thread.
 
 ## Confirm before writing

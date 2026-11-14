@@ -98,9 +98,8 @@ mcp_servers:
 
 Hermes can also load the [SKILL.md](../SKILL.md) guide, which tells the agent
 which tool fits which job and what needs confirming first. Copy it to
-`~/.hermes/skills/mcp/spectre/SKILL.md` (plus
-[references/full-follower-extraction.md](../references/full-follower-extraction.md)
-in `references/`), then reload with `/reload-mcp` and `/reload-skills`.
+`~/.hermes/skills/mcp/spectre/SKILL.md`, then reload with `/reload-mcp` and
+`/reload-skills`.
 
 ## From Python
 

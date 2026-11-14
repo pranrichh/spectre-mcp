@@ -135,10 +135,11 @@ offset.
 reply only where a human reply is warranted. `mentions` and `replies` are the
 actionable ones; likes and follows are not.
 
-**Full follower export (past the tool limits).** Use
-`get_followers(handle, limit=5000)` first; if you need literally everyone, the
-`references/full-follower-extraction.md` recipe drives twscrape directly in
-Spectre's own environment.
+**Full follower export.** `get_followers(handle, limit=5000)` walks X's cursor and
+returns `count`, `truncated` and `total_available`, so you can report coverage
+honestly ("1,000 of 48,211") instead of implying a full scan. For a complete pull
+of a very large account, call it in slices and keep the returned users in a file
+between calls.
 
 ## Things that bite
 
