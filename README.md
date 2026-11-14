@@ -110,20 +110,6 @@ For client-specific setup (Hermes skill, Claude, Cursor, Python), see [Integrati
 > **No `uv`?** Install it: `curl -LsSf https://astral.sh/uv/install.sh | sh`
 > Or use `python3 -m spectre.server` to run from a local clone.
 
-### 4. Call a Tool — IDs Are Strings
-
-Every tool that takes an X ID (`tweet_id`, `user_id`, `list_id`, `community_id`, `reply_to`, `quote_tweet`) takes it as a **string**:
-
-```python
-get_me()                                     # which account is live
-search("mcp server", limit=20)               # full X operator syntax
-get_user("elonmusk")                         # profile + numeric id
-get_tweet("2111332908657148356")
-post_tweet("hello from an agent")
-```
-
-X IDs are 64-bit integers. Most MCP clients and model APIs parse JSON numbers as IEEE-754 doubles, which rounds anything above 2^53 — `2111332908657148356` silently becomes `2111332908657148416`, and the tool reports a perfectly good tweet as "not found or deleted". Passing the ID as a string removes the round-trip entirely. A full `https://x.com/...` URL works too, and a plain integer is still accepted.
-
 ---
 
 <p align="center">

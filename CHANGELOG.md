@@ -3,6 +3,11 @@
 All notable changes to `spectre-mcp`. Versioning is semver; the tool surface is
 the public API.
 
+## 2.0.2 — 2026-11-14
+
+README: drop the "Call a tool" step from the quick start. IDs-as-strings is
+covered in [docs/reference.md](docs/reference.md). No code changes.
+
 ## 2.0.1 — 2026-11-14
 
 Documentation and listing refresh — no code changes.
